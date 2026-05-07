@@ -32,6 +32,10 @@ __MACOSX/
 *.json
 *.csv
 
+## Keep datasets in repo (override global jsonl ignore)
+!datasets/
+!datasets/*.jsonl
+
 ## Large model / checkpoint folders seen in this repo
 Llama3.2-1B-Instruct/
 OpenELM-1_1B-Instruct/
