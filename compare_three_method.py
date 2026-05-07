@@ -17,7 +17,7 @@ L_Lyapunov for method=dynamics) vs. training steps, parsed from each run's
 PPL is exp(mean NLL) over all non-masked label positions (labels != -100), using the same
 chat template / masking as each training path.
 
-STP-style extras (Huang et al.): --eval_accuracy, --eval_token_accuracy, --eval_snr_proxy;
+STP-style extras: --eval_accuracy, --eval_token_accuracy, --eval_snr_proxy;
 --data_fraction for seeded train subsampling (data efficiency).
 
 Examples
@@ -339,7 +339,12 @@ def parse_args():
     p.add_argument("--predictors", type=int, default=0)
     p.add_argument("--eval_batch_size", type=int, default=4, help="Batch size for PPL only.")
     p.add_argument("--skip_train", action="store_true", help="Only compute PPL on existing dirs.")
-    p.add_argument("--ckpt_regular", type=str, default="/project/khanhnt/control_theory/llm-jepa/compare_three_runs_test/regular")
+    p.add_argument(
+        "--ckpt_regular",
+        type=str,
+        default="",
+        help="Optional checkpoint path for a regular baseline.",
+    )
     p.add_argument("--ckpt_stp", type=str, default=None)
     p.add_argument("--ckpt_dynamics", type=str, default=None)
     p.add_argument(
@@ -374,7 +379,7 @@ def parse_args():
         choices=("fork", "llm_jepa_official"),
         help=(
             "Greedy exact-match generation: fork uses min(256,max_length) new tokens; "
-            "llm_jepa_official uses galilai-group/llm-jepa defaults (128 new, 512 total)."
+            "llm_jepa_official uses reference defaults (128 new, 512 total)."
         ),
     )
     p.add_argument("--snr_max_batches", type=int, default=80, help="Max batches for --eval_snr_proxy.")

@@ -1,4 +1,4 @@
-"""LLM-JEPA.
+"""Fine-tuning entrypoint.
 """
 
 import copy

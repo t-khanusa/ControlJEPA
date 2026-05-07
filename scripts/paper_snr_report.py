@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pretty-print Semantic Tube geometric SNR + Appendix‑H Gaussian surrogates (Huang et al. arXiv:2602.22617).
+"""Pretty-print tube geometric SNR + Gaussian surrogates.
 
 This is a thin wrapper around ``diagnose_signal_noise.measure_one_model``: it runs a
 forward-only pass over JSONL chats, aggregates chord‑projection energies, and echoes

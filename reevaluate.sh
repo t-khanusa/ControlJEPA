@@ -32,7 +32,7 @@ cd "$(dirname "$0")"
 ONLY=${ONLY//,/ }
 EXCLUDE=${EXCLUDE//,/ }
 
-PYTHON=/home/khanhnt/.conda/envs/LinOSS/bin/python
+PYTHON=${PYTHON:-python}
 
 _mnt_for_dataset() {
   # GT-length quantiles (Llama-3.2 tokenizer, checked on the actual test sets):

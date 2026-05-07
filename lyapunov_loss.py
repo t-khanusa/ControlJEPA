@@ -2,7 +2,7 @@
 Lyapunov-tube regularizer for control_JEPA.
 =============================================
 
-Drop-in auxiliary loss that wraps the LLM-JEPA token trajectory with a
+Drop-in auxiliary loss that wraps a token trajectory with a
 Lyapunov-flavored transversal-energy constraint. Given user span
 ``[u_s, u_e]`` (inclusive) and assistant span ``[a_s, a_e]`` (inclusive) in
 the hidden-state sequence ``h`` of shape ``(B, T, D)``, we define
@@ -49,7 +49,6 @@ manifold.
 
 References
 ----------
-- Huang et al., *Semantic Tube Prediction* (LLM-JEPA, geodesic / perp. noise).
 - Khalil, *Nonlinear Systems*, 3rd ed., ch. 4 (ISS / input-to-state stability).
 - Wiggins, *Introduction to Applied Nonlinear Dynamical Systems and Chaos*
   (Ch. 1-2, Lyapunov functions on discrete maps).
@@ -308,7 +307,7 @@ class LyapunovControlLoss(nn.Module):
 class LyapunovReachabilityLoss(nn.Module):
     """Joint transverse-longitudinal Lyapunov loss (reach_JEPA).
 
-    This is the method we propose for the main NeurIPS submission. Unlike
+    Unlike
     :class:`LyapunovControlLoss`, which constrains only the transverse residual
     ``e_t``, this loss defines a composite Lyapunov candidate that jointly
     controls:

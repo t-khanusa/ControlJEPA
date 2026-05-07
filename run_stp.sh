@@ -8,7 +8,7 @@
 # comparable.
 #
 # Methods:
-#   1. stp               : LLM-JEPA STP with random_span cosine loss (baseline to beat).
+#   1. stp               : STP with random_span cosine loss (baseline to beat).
 #   2. control_d_t       : Lyapunov-tube, V_t = ||e_t||^2 / ||d_t||^2   (angle + anchor_eps=1e-3).
 #   3. control_v_geo     : Lyapunov-tube, V_t = ||e_t||^2 / ||v_geo||^2 (chord).
 #   4. reach_jepa        : Lyapunov-Reachability with schedule_asym progress
@@ -26,7 +26,7 @@
 # sampling random sub-segments of the token trajectory per step and
 # enforcing V_{t+1} <= gamma V_t + tau over them. Interpretation: an
 # Alg 2-style path-integral Monte Carlo estimator of the multi-scale
-# contraction functional (see LyaNet Alg 2 / Wu-LeCun 2025 continuous-
+# contraction functional (see e.g. Alg 2 / continuous-token hypothesis),
 # token hypothesis). Uses the exact same get_s_t distribution as STP so
 # we can attribute any gap to the *loss*, not the sampler.
 #   6. control_d_t_rs    : (2) evaluated on random sub-segments.
@@ -90,7 +90,7 @@ _launch() {
 #   spider           (SQL followed by prose, broke sqlite3 execution compare)
 # We now cap per-dataset; see evaluate.py for the matching comparator fixes.
 #
-# Apples-to-apples with galilai-group/llm-jepa upstream eval defaults:
+# Optional reference evaluation profile (fixed generation defaults):
 #   EVAL_PROFILE=llm_jepa_official bash run_stp.sh
 # (forces max_new_tokens=128, max_length=512 in evaluate.py; ignores _mnt caps.)
 EVAL_PROFILE="${EVAL_PROFILE:-fork}"
@@ -189,7 +189,7 @@ run_control_jepa() {
 }
 
 run_reach_jepa() {
-  # Lyapunov-Reachability regularizer (the NeurIPS-candidate method).
+  # Lyapunov-Reachability regularizer.
   # V_t = alpha * V_\perp  +  beta * V_prog, with progress_mode selecting
   # the longitudinal term and --linear selecting the V_\perp form:
   #   linear=reach_JEPA        -> V_\perp = ||e_t||^2 / L^2   (classical)
@@ -405,7 +405,7 @@ for dataset in "${datasets[@]}"; do
       # #   ;;
 
       control_v_geo)
-        model_folder=${model_tag}/khanhnt-ft-c-v_geo-${ds_tag}-g${tube_gamma}-t${tube_tau}-${learning_rate}-${lbd_control}-${predictors}-${seed}
+        model_folder=${model_tag}/ft-c-v_geo-${ds_tag}-g${tube_gamma}-t${tube_tau}-${learning_rate}-${lbd_control}-${predictors}-${seed}
         # skip_if_model_exists "control_v_geo" "${ds_tag}" "${seed}" "${model_folder}" && continue
         banner "[${model_tag}|${ds_tag}|s=${seed}] method=control_JEPA/v_geo (chord) -> ${model_folder}"
         run_control_jepa ${model_name} ${learning_rate} ${epoch} ${lt} ${predictors} ${seed} ${lbd_control} ${dataset} ${model_folder} v_geo ${tube_gamma} ${tube_tau} ${anchor_eps} 0

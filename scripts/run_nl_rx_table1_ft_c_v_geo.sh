@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce Paper Table 1 style bins for ft-c-v_geo (conda env controlJEPA).
+# Reproduce suffix-bin accuracy for ft-c-v_geo (conda env controlJEPA).
 #
 #   conda activate controlJEPA
 #   bash scripts/run_nl_rx_table1_ft_c_v_geo.sh

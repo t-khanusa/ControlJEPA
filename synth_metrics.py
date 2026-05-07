@@ -1,6 +1,6 @@
 """SYNTH scoring helpers shared by evaluate scripts (torch-free).
 
-- Strict EM used in galilai-group/llm-jepa: stripped equality.
+- Strict EM: stripped equality.
 - Engineering-relaxed: same as fork ``evaluate.py`` generic branch (prefix +
   non-alphanumeric boundary after gold).
 """

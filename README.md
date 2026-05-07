@@ -1,4 +1,4 @@
-# LLM-JEPA
+# Project
 
 ## Set Up
 
@@ -26,9 +26,9 @@ Other flags are documented in `stp.py`.
 
 `run_stp_jepa()` will ignore `predictors`.
 
-## LLM-JEPA Fine-tuning
+## Fine-tuning
 
-The fine-tuning script is in `finetune.py`. A convenient driver script, `run.sh`, provides `run_regular()` for standard fine-tuning, and `run_jepa()` for LLM-JEPA fine-tuning.
+The fine-tuning script is in `finetune.py`. A convenient driver script, `run.sh`, provides `run_regular()` for standard fine-tuning, and `run_jepa()` for JEPA-style fine-tuning.
 
 For all experiments, we fix number of epochs to 4. The `last_token` setting depends on the model family; see the commented lines in `run.sh` for how to set it. Each configuration is run with 5 random seeds. We report mean accuracy and standard deviation.
 
@@ -38,9 +38,9 @@ The original implementation required two additional forward passes to encode `Te
 
 Similarly, we provide `finetune8bh200.py` and `run8bh200.sh` for training modesl up to 8B parameters on NVIDIA H200 GPUs.
 
-## LLM-JEPA with LoRA
+## LoRA
 
-Use `--lora` and `--lora_rank <N>` to enable LoRA fine-tuning for LLM-JEPA.
+Use `--lora` and `--lora_rank <N>` to enable LoRA fine-tuning.
 
 ## Pretraining
 
@@ -75,7 +75,7 @@ The fine-tuning script `finetune.py` supports `--jepa_ratio` to implement **rand
 
 When dropout is active, the extra forward pass for `Enc(Text)` and `Enc(Code)` is skipped. If the dropout rate `LD = alpha`, then correspondingly `--jepa_ratio` should be set to `1 - alpha`. On average, one training step costs `(2 - alpha)X` the compute of standard fine-tuning.
 
-Empirical results show that LLM-JEPA can tolerate aggressive dropout rate (e.g., `LD = 0.75`), requiring `1.25X` the compute while maintaining fine-tuning performance.
+Empirical results show that the JEPA auxiliary objective can tolerate aggressive dropout rate (e.g., `LD = 0.75`), requiring `1.25X` the compute while maintaining fine-tuning performance.
 
 ## Datasets
 

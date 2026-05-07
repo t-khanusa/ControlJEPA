@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 : "${MODEL_NAME:=meta-llama/Llama-3.2-1B-Instruct}"
 : "${MNT:=128}"
 
-PYTHON=/home/khanhnt/.conda/envs/LinOSS/bin/python
+PYTHON=${PYTHON:-python}
 
 if [[ -z "$FOLDERS" ]]; then
   echo "ERROR: set FOLDERS= to a space-separated list of checkpoint directories." >&2

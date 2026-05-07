@@ -1,8 +1,8 @@
 """
-Evaluation metrics aligned with Huang et al., Semantic Tube Prediction (STP):
+Evaluation metrics:
   - Task accuracy (exact match on NL-RX-style synth by default; extensible).
   - Teacher-forced next-token accuracy on supervised spans (complements PPL).
-  - Tube geometry SNR proxy: mean ||parallel||^2 / mean ||perpendicular||^2 (STP signal/noise picture).
+  - Tube geometry SNR proxy: mean ||parallel||^2 / mean ||perpendicular||^2.
 
 Data-efficiency: use compare_three_method --data_fraction with a seeded subsample of train JSONL.
 """
@@ -414,7 +414,7 @@ def compute_exact_match_accuracy(
     Uses the same chat formatting as evaluate.py for non-plain models.
 
     eval_profile: fork uses max_new_tokens/max_length as given; llm_jepa_official
-    forces galilai-group/llm-jepa evaluate.py defaults (128 / 512).
+    forces reference generation defaults (128 / 512).
     """
     import evaluate as eval_mod
 

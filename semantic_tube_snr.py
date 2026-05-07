@@ -1,7 +1,7 @@
 """
-Signal-to-noise tooling aligned with Huang, LeCun & Balestriero (arXiv:2602.22617).
+Signal-to-noise tooling for tube-geometry diagnostics.
 
-The paper distinguishes two notions:
+This module distinguishes two notions:
 
 **Appendix H (information-theoretic, not directly observable in latents)**  
 Additive Gaussian surrogate ``X = Z + N`` with

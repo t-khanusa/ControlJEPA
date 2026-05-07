@@ -1,5 +1,4 @@
-"""Evaluation for LLM-JEPA.
-"""
+"""Evaluation script."""
 
 import copy
 import numpy as np
@@ -37,10 +36,9 @@ import warnings
 warnings.filterwarnings("ignore", message="The following generation flags are not valid")
 
 # ---------------------------------------------------------------------------
-# galilai-group/llm-jepa `evaluate.py` defaults (OpenReview / GitHub lineage).
-# Use `--eval_profile llm_jepa_official` to force these for apples-to-apples
-# comparison with the upstream repo, overriding per-dataset caps from shell.
-# Ref: https://github.com/galilai-group/llm-jepa/blob/main/evaluate.py (argparse defaults).
+# Optional reference evaluation profile with fixed generation defaults.
+# Use `--eval_profile llm_jepa_official` to force these values regardless of
+# any per-dataset caps passed by wrappers.
 # ---------------------------------------------------------------------------
 LLM_JEPA_OFFICIAL_MAX_NEW_TOKENS = 128
 LLM_JEPA_OFFICIAL_MAX_LENGTH = 512
@@ -49,7 +47,7 @@ VALID_EVAL_PROFILES = ("fork", "llm_jepa_official")
 
 
 def apply_eval_profile(args: argparse.Namespace) -> None:
-    """Mutate generation-related fields on `args` when matching official LLM-JEPA eval."""
+    """Mutate generation-related fields on `args` when matching a fixed reference profile."""
     profile = getattr(args, "eval_profile", "fork")
     if profile == "llm_jepa_official":
         args.max_length = LLM_JEPA_OFFICIAL_MAX_LENGTH
@@ -57,7 +55,7 @@ def apply_eval_profile(args: argparse.Namespace) -> None:
         print(
             "[eval_profile=llm_jepa_official] "
             f"max_new_tokens={args.max_new_tokens}, max_length={args.max_length} "
-            "(galilai-group/llm-jepa evaluate.py defaults; shell caps ignored).",
+            "(reference defaults; shell caps ignored).",
             flush=True,
         )
     elif profile != "fork":
@@ -489,7 +487,7 @@ spider_pattern = re.compile(r"For db_id:\[(.+)\]")
 
 
 def spider_eval(generated, ground_truth, spider_path, debug=0):
-    # Faithful to the STP paper's original spider_eval: pass raw generated SQL
+    # Pass raw generated SQL
     # straight to sqlite3 and compare stdout == stdout. No _truncate_sql, no
     # empty-gt guard (the paper counts empty==empty as a match).
     #
@@ -663,14 +661,13 @@ def eval(generated, ground_truth, input_file, spider_path, startswith=False, deb
         return first.lower() == gt.lower()
 
     if kind == "synth":
-        # LLM-JEPA / STP paper synth: exact string match on stripped generation and gold
-        # (same semantics as galilai-group/llm-jepa evaluate.py default branch for non-gsm8k/spider/nq).
+        # Exact string match on stripped generation and gold.
         gt = (ground_truth[2]["content"] or "").strip()
         gen = (generated or "").strip()
         if debug == 1:
             print("[GEN]", repr(gen))
             print("[GT:]", repr(gt))
-            print("-----synth (paper / upstream strict)-----")
+            print("-----synth (strict)-----")
         return gen == gt
 
     # Default: generic / unknown JSONL. Lenient prefix match for models that
@@ -706,7 +703,7 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
     print(f"Loaded {len(dataset)} examples from {input_file}")
     if os.path.basename(input_file or "").lower().startswith("synth"):
         print(
-            "[synth] Strict EM (paper/upstream): stripped(gen)==stripped(gt). "
+            "[synth] Strict EM: stripped(gen)==stripped(gt). "
             "Also prints SYNTH engineering-relaxed rate (prefix+non-alnum boundary). "
             "Use --eval_profile llm_jepa_official for HF gen defaults (max_new_tokens=128, max_length=512).",
             flush=True,
@@ -948,7 +945,7 @@ def main():
         choices=list(VALID_EVAL_PROFILES),
         help=(
             "fork: honor --max_new_tokens/--max_length from CLI/shell (e.g. run_stp.sh "
-            "per-dataset caps). llm_jepa_official: force galilai-group/llm-jepa defaults "
+            "per-dataset caps). llm_jepa_official: force reference defaults "
             f"(max_new_tokens={LLM_JEPA_OFFICIAL_MAX_NEW_TOKENS}, "
             f"max_length={LLM_JEPA_OFFICIAL_MAX_LENGTH}) for apples-to-apples comparison."
         ),
@@ -971,7 +968,12 @@ def main():
     parser.add_argument("--t_sne_type", type=str, default=None, help="The t-SNE type, can be `in_n_out`, `paraphrase`, or`rotten_tomatoes`.")
     parser.add_argument("--startswith", action="store_true", help="Wither to report match if generated starts with ground-truth.")
     parser.add_argument("--plain", action="store_true", help="When set, do not apply chat format, and append `<|perception|>` to the prompt.")
-    parser.add_argument("--spider_path", type=str, default="/project/khanhnt/control_theory/test/llm-jepa/spider_data", help="Path to spider databases.")
+    parser.add_argument(
+        "--spider_path",
+        type=str,
+        default="spider_data/database",
+        help="Path to spider databases.",
+    )
     parser.add_argument("--unmask_assistant_special_tokens", action="store_true", help="When set, unmask assistant special tokens. Should match the training configuration.")
 
     

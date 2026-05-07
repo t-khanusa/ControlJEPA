@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Batch test all ft-c-v_geo-synth-* checkpoints in /root/khanhnt/Llama3.2-1B-Instruct.
+Batch test all ft-c-v_geo-synth-* checkpoints under a directory of your choice.
 
 Runs the NL-RX Table 1 style greedy exact-match accuracy by gold suffix for each checkpoint found.
 
@@ -131,7 +131,7 @@ def main() -> int:
     p.add_argument(
         "--checkpoints_dir",
         type=str,
-        default="/root/khanhnt/Llama3.2-1B-Instruct",
+        default="Llama3.2-1B-Instruct",
         help="Directory containing candidate checkpoints.",
     )
     p.add_argument(

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # Data Efficiency experiment for control_v_geo with Llama-3.2-1B-Instruct
-# on NL-RX-SYNTH, replicating the protocol in STP paper Section 4.3.
+# on NL-RX-SYNTH, following the same data-fraction sweep protocol.
 #
 # Protocol (from paper):
 #   - Randomly subsample 1/2, 1/4, 1/8, 1/16, 1/32 of synth_train.jsonl
@@ -13,7 +13,7 @@
 # Methods run at each data fraction:
 #   1. control_v_geo (NTP + L_control): the method under study
 #   2. regular NTP: baseline for comparison
-#   3. STP (NTP + L_STP): STP paper's own method for comparison
+#   3. STP (NTP + L_STP): STP baseline for comparison
 #
 # Hyperparameters (inherited from existing full-data control_v_geo runs):
 #   control_v_geo: gamma=0.80, tau=1e-3, lbd_control=0.01, anchor_eps=1e-5
@@ -29,7 +29,7 @@
 #   METHODS="control_v_geo" bash run_data_efficiency.sh  # only control_v_geo
 #   SEEDS="82 23" bash run_data_efficiency.sh         # only 2 seeds
 #   NPROC_PER_NODE=4 bash run_data_efficiency.sh      # use 4 GPUs
-#   EVAL_PROFILE=llm_jepa_official bash run_data_efficiency.sh  # galilai/llm-jepa eval defaults (128/512)
+#   EVAL_PROFILE=llm_jepa_official bash run_data_efficiency.sh  # reference eval defaults (128/512)
 # ---------------------------------------------------------------------------
 
 set -e
@@ -277,7 +277,7 @@ for frac in $FRACTIONS; do
         ;;
 
       # ===================================================================
-      # 3. STP baseline (random_span cosine, same as STP paper)
+      # 3. STP baseline (random_span cosine)
       # ===================================================================
       stp)
         # --- 3a: 1Flop ---

@@ -452,10 +452,10 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
     def create_masked_labels(messages, tokenizer, input_ids, attention_mask):
         """Create labels with input tokens masked (-100).
 
-        Matches galilai-group/llm-jepa ``create_masked_labels``: only the
+        Matches the baseline ``create_masked_labels`` behavior: only the
         assistant *content* tokens are supervised; we do **not** add extra
         loss on end-of-turn / EOS tokens after the answer. That keeps training
-        aligned with the published STP / LLM-JEPA recipe and with strict
+        aligned with the baseline recipe and with strict
         ``gen.strip() == gt.strip()`` synth evaluation in ``evaluate.py``.
         """
         labels = [-100] * len(input_ids)
@@ -2145,7 +2145,7 @@ def main():
     # (same distribution as STP's --linear=random_span) and enforce
     # contraction over that segment only. Motivation: the contraction
     # V_{t+1} <= gamma V_t + tau must hold over the full continuous
-    # trajectory by LeCun's continuous-token hypothesis (Wu/LeCun 2025,
+    # trajectory by the continuous-token hypothesis,
     # Sec. 4); step-by-step enforcement only samples the t -> t+1 scale,
     # whereas random-span samples scales from 1 to (L-1) tokens. This is
     # an Alg 2-style path-integral Monte Carlo estimator of the same

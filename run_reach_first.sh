@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -e
-# Launch a single reach_JEPA experiment (proposed method: alpha=1, beta=1)
+# Launch a single reach_JEPA experiment (alpha=1, beta=1)
 # to validate the pipeline end-to-end before running the full sweep.
-source /home/khanhnt/.conda/envs/LinOSS/bin/activate 2>/dev/null || \
-    export PATH=/home/khanhnt/.conda/envs/LinOSS/bin:$PATH
+# Assumes your environment already has the dependencies installed.
 
 # Shared configs (match compare_three_runs_dt / run1 so we can compare heads-up)
 model_name=meta-llama/Llama-3.2-1B-Instruct
