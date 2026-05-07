@@ -5,6 +5,7 @@ import copy
 import math
 import numpy as np
 import os
+from typing import List, Tuple
 # import re
 import random
 import time
@@ -28,6 +29,84 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType
 import argparse
+
+from lyapunov_loss import (
+    LyapunovControlLoss,
+    LyapunovReachabilityLoss,
+    VALID_NORMS as _CONTROL_VALID_NORMS,
+    VALID_REACH_TRANSVERSE_NORMS as _REACH_VALID_TRANSVERSE_NORMS,
+)
+
+
+def chord_difference_text_minus_code(
+    hidden_states: torch.Tensor,
+    user_start_end: torch.Tensor,
+    assistant_start_end: torch.Tensor,
+) -> torch.Tensor:
+    """Δ = chord(user span) − chord(assistant span) at the prediction layer.
+
+    chord ≈ Enc(last_token) − Enc(first_token) along each role span, analogous to
+    a finite-difference surrogate for ``Enc(Text) − Enc(Code)`` used in Semantic
+    Tube diversity / polymorphism diagnostics (Sec. ``Preserving Diversity``).
+
+    Indices follow the same (+1/+1 inclusive) conventions as ``linear=e2e`` in
+    :meth:`RepresentationTrainer.compute_loss`.
+
+    Args
+    ----
+    hidden_states :
+        Shape ``(B, T, D)``.
+    user_start_end, assistant_start_end :
+        Integer tensors of shape ``(B, 2)`` storing *template* offsets (matching
+        the rest of this file).
+
+    Returns
+    -------
+    Tensor of shape ``(B, D)``.
+    """
+    bsz = hidden_states.shape[0]
+    dev = hidden_states.device
+    r = torch.arange(bsz, device=dev)
+
+    ue0 = hidden_states[r, user_start_end[:, 0]]
+    ue1 = hidden_states[r, user_start_end[:, 1]]
+    ae0 = hidden_states[r, assistant_start_end[:, 0]]
+    ae1 = hidden_states[r, assistant_start_end[:, 1]]
+
+    chord_user = ue1 - ue0
+    chord_assistant = ae1 - ae0
+    return chord_user - chord_assistant
+
+
+def polymorphism_decorrelation_loss(
+    delta: torch.Tensor,
+    proj: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Barlow-Twins-style redundancy reduction on projected *directional* residuals.
+
+    Let ``Zn`` be centred random projections of ``F.normalize(delta)`` batch-wise.
+    Minimizing squared off-diagonal correlations encourages non-collapsed
+    cross-batch structure in directional space (orthogonal to collapsing every
+    example onto the dominant frequent-regex mode).
+
+    Parameters
+    ----------
+    delta :
+        ``(B, D)`` raw coordinate differences ``Enc_text − Enc_code`` surrogate.
+    proj :
+        Frozen ``(D, P)`` Gaussian projection stored on the trainer.
+    """
+    if delta.dim() != 2:
+        raise ValueError(f"delta must be (B, D); got {tuple(delta.shape)}")
+    z = F.normalize(delta, p=2, dim=1, eps=eps) @ proj
+    z = z - z.mean(dim=0, keepdim=True)
+    denom = max(z.shape[0], 2) - 1
+    c = z.T @ z / (float(denom) + eps)
+    diag_mx = torch.diag_embed(torch.diagonal(c))
+    off = c - diag_mx
+    return (off**2).mean()
 
 
 def get_messages(model_name, messages):
@@ -72,7 +151,11 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
     dataset = load_dataset('json', data_files=data_file)['train']
     if  torch.cuda.current_device() == 0:
         print(f"Loaded {len(dataset)} examples from {data_file}")
-    
+
+    # Basename-based routing: `data_file` may be "datasets/hellaswag_train.jsonl",
+    # so prefix checks against the raw path silently miss the hellaswag branch.
+    data_basename = os.path.basename(data_file or "")
+
     def tokenize_conversations(examples):
         """Tokenize conversations and mask input tokens properly"""
         input_ids_list = []
@@ -127,8 +210,15 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             labels_list.append(labels)
             attention_mask_list.append(attention_mask)
 
-            if data_file.startswith("hellaswag"):
-                user_messages = examples["text"][msg_idx]
+            if data_basename.startswith("hellaswag"):
+                # deepcopy: the predictor-token loop below mutates
+                # user_messages[0]["content"] in place, and Gemma also
+                # needs a role rewrite (see assistant branch for details).
+                # Both would otherwise leak into the HF-cached batch.
+                user_messages = copy.deepcopy(examples["text"][msg_idx])
+                if "google/gemma" in model_name:
+                    for m in user_messages:
+                        m["role"] = "user"
                 if debug == 8:
                     print(json.dumps(messages, indent=2))
                     print(json.dumps(user_messages, indent=2))
@@ -166,9 +256,29 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             user_input_ids_list.append(tokenized_user["input_ids"])
             user_labels_list.append([-100] * len(tokenized_user["input_ids"]))
             user_attention_mask_list.append(tokenized_user["attention_mask"])
-            if data_file.startswith("hellaswag"):
-                content = examples["text"][msg_idx][0]["content"] + "\n"
-                user_start, user_end = find_start_end(content, tokenizer, input_ids, attention_mask)
+            if data_basename.startswith("hellaswag"):
+                # HellaSwag rows can differ slightly in whitespace/newline formatting
+                # between `messages` and auxiliary `text/code` fields. Try stable
+                # message content first, then a few whitespace variants.
+                user_candidates = [
+                    messages[1]["content"],
+                    examples["text"][msg_idx][0]["content"],
+                    messages[1]["content"] + "\n",
+                    examples["text"][msg_idx][0]["content"] + "\n",
+                    messages[1]["content"].strip(),
+                ]
+                user_start = user_end = None
+                for user_content in user_candidates:
+                    try:
+                        user_start, user_end = find_start_end(user_content, tokenizer, input_ids, attention_mask)
+                        break
+                    except AssertionError:
+                        continue
+                if user_start is None:
+                    raise AssertionError(
+                        f"Cannot locate hellaswag user span for row={msg_idx}. "
+                        f"Tried {len(user_candidates)} candidates."
+                    )
             elif "allenai/OLMo" in model_name:
                 content = messages[1]["content"] + "\n"
                 user_start, user_end = find_start_end(content, tokenizer, input_ids, attention_mask)
@@ -176,8 +286,21 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 user_start, user_end = find_start_end(messages[1]["content"], tokenizer, input_ids, attention_mask)
             user_start_end_list.append([user_start, user_end])
 
-            if data_file.startswith("hellaswag"):
-                assistant_messages = examples["code"][msg_idx]
+            if data_basename.startswith("hellaswag"):
+                # hellaswag's "code" field is tagged role="assistant", but
+                # Gemma's chat template enforces strict alternation starting
+                # at role="user" and raises
+                #   "Conversation roles must alternate user/assistant/..."
+                # on a lone assistant turn. Mirror the get_assistant_messages
+                # gemma branch (stp.py:65-68) and rewrite role->"user" so
+                # apply_chat_template renders a single user turn. deepcopy
+                # prevents the rewrite from leaking back into the HF
+                # dataset batch (which would otherwise persist across
+                # batches within the same dataset.map call).
+                assistant_messages = copy.deepcopy(examples["code"][msg_idx])
+                if "google/gemma" in model_name:
+                    for m in assistant_messages:
+                        m["role"] = "user"
                 if debug == 8:
                     print(json.dumps(assistant_messages, indent=2))
                     exit(0)
@@ -205,12 +328,27 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             assistant_input_ids_list.append(tokenized_assistant["input_ids"])
             assistant_labels_list.append([-100] * len(tokenized_assistant["input_ids"]))
             assistant_attention_mask_list.append(tokenized_assistant["attention_mask"])
-            if data_file.startswith("hellaswag"):
-                content = examples["code"][msg_idx][0]["content"]
-                content = " " + content + "\n"
-                # if messages[2]["content"] != "D":
-                #     content += "\n"
-                assistant_start, assistant_end = find_start_end(content, tokenizer, input_ids, attention_mask)
+            if data_basename.startswith("hellaswag"):
+                assistant_candidates = [
+                    messages[2]["content"],
+                    examples["code"][msg_idx][0]["content"],
+                    " " + messages[2]["content"],
+                    " " + examples["code"][msg_idx][0]["content"],
+                    messages[2]["content"] + "\n",
+                    " " + messages[2]["content"] + "\n",
+                ]
+                assistant_start = assistant_end = None
+                for assistant_content in assistant_candidates:
+                    try:
+                        assistant_start, assistant_end = find_start_end(assistant_content, tokenizer, input_ids, attention_mask)
+                        break
+                    except AssertionError:
+                        continue
+                if assistant_start is None:
+                    raise AssertionError(
+                        f"Cannot locate hellaswag assistant span for row={msg_idx}. "
+                        f"Tried {len(assistant_candidates)} candidates."
+                    )
             elif "apple/OpenELM" in model_name:
                 try:
                     assistant_start, assistant_end = find_start_end(messages[2]["content"], tokenizer, input_ids, attention_mask)
@@ -312,7 +450,14 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
         return labels
 
     def create_masked_labels(messages, tokenizer, input_ids, attention_mask):
-        """Create labels with input tokens masked (-100)"""
+        """Create labels with input tokens masked (-100).
+
+        Matches galilai-group/llm-jepa ``create_masked_labels``: only the
+        assistant *content* tokens are supervised; we do **not** add extra
+        loss on end-of-turn / EOS tokens after the answer. That keeps training
+        aligned with the published STP / LLM-JEPA recipe and with strict
+        ``gen.strip() == gt.strip()`` synth evaluation in ``evaluate.py``.
+        """
         labels = [-100] * len(input_ids)
 
         # Mask padding tokens in labels
@@ -320,31 +465,58 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             if mask == 0:  # Padding token
                 labels[i] = -100
 
-        # Find assistant responses and unmask only those tokens
+        def _resolve_assistant_span(content):
+            """Return ``(start_prev, end_incl)`` matching ``find_start_end``."""
+            candidates = [(content, False)]
+            if "apple/OpenELM" in model_name:
+                candidates.append(("\n" + content, True))
+            for c, remove_ln in candidates:
+                try:
+                    return find_start_end(
+                        c, tokenizer, input_ids, attention_mask,
+                        remove_leading_newline=remove_ln,
+                    )
+                except AssertionError:
+                    continue
+            # Last resort: legacy per-token decode list equality (same as
+            # pre-2026-04 ``create_masked_labels``). Keeps gsm8k/hellaswag
+            # rows working when ``find_start_end``'s decode-on-slice window
+            # is too tight for very long assistant spans.
+            assistant_tokens = tokenizer.encode(content, add_special_tokens=False)
+            decoded_assistant = [tokenizer.decode(item) for item in assistant_tokens]
+            decoded_input = [tokenizer.decode(item) for item in input_ids]
+            N = len(assistant_tokens)
+            if N == 0:
+                raise AssertionError("empty assistant content")
+            for i in range(len(input_ids) - N, -1, -1):
+                if attention_mask[i] == 1 and decoded_input[i:i + N] == decoded_assistant:
+                    return i - 1, i + N - 1
+            raise AssertionError(f"legacy match failed for {content!r}")
+
+        # Find assistant responses and unmask only those tokens.
+        # Prefer ``find_start_end`` (fast path + decode-on-slice fallback)
+        # so SentencePiece context-dependent merges match (critical for
+        # OpenELM + Llama-2 tokenizer on synth). Fall back to the legacy
+        # per-token decode list when needed.
         for msg in messages:
             if msg['role'] == 'assistant':
                 assistant_content = msg['content']
+                try:
+                    start_prev, end_incl = _resolve_assistant_span(assistant_content)
+                except AssertionError:
+                    if torch.cuda.current_device() == 0:
+                        print(f"[create_masked_labels] WARNING: could not "
+                              f"locate assistant content {assistant_content!r}")
+                    continue
+                # find_start_end returns (content_start - 1, content_end);
+                # content span in input_ids is [start_prev + 1, end_incl].
+                content_start = start_prev + 1
+                content_end_excl = end_incl + 1
+                for j in range(content_start, content_end_excl):
+                    if attention_mask[j] == 1:
+                        labels[j] = input_ids[j]
 
-                # Find where this assistant response appears in the tokenized text
-                assistant_tokens = tokenizer.encode(assistant_content, add_special_tokens=False)
-
-                # Find the position of assistant response in input_ids
-                decoded_assistant = [tokenizer.decode(item) for item in assistant_tokens]
-                decoded_input = [tokenizer.decode(item) for item in input_ids]
-                for i in range(len(input_ids) - len(assistant_tokens) + 1):
-                    # Only check non-padding tokens
-                    if debug == 4 and torch.cuda.current_device() == 0:
-                        print(f"=======input_ids: {input_ids[i:i + len(assistant_tokens)]}")
-                        print(f"assistant_tokens: {assistant_tokens}")
-                    # if attention_mask[i] == 1 and input_ids[i:i+len(assistant_tokens)] == assistant_tokens:
-                    if attention_mask[i] == 1 and decoded_input[i:i + len(assistant_tokens)] == decoded_assistant:
-                        # Unmask the assistant response tokens
-                        for j in range(i, min(i + len(assistant_tokens), len(input_ids))):
-                            if attention_mask[j] == 1:  # Only unmask non-padding tokens
-                                labels[j] = input_ids[j]
-                        break
-
-                if debug == 4:
+                if debug == 4 and torch.cuda.current_device() == 0:
                     exit(0)
 
         return labels
@@ -356,10 +528,12 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
         if plain:
             prompt = tokenizer(messages[1]["content"] + "<|perception|>", add_special_tokens=False)['input_ids']
         else:
-            prompt = tokenizer.apply_chat_template(messages[:-1], add_generation_prompt=True)
+            prompt_txt = tokenizer.apply_chat_template(
+                messages[:-1], tokenize=False, add_generation_prompt=True)
+            prompt = tokenizer(prompt_txt, add_special_tokens=False)["input_ids"]
 
         labels = [label if unmasked else -100 for label, unmasked in zip(input_ids, attention_mask)]
-        labels[:len(prompt)] = [-100] * len(prompt)
+        labels[: len(prompt)] = [-100] * len(prompt)
 
         if debug == 4 and torch.cuda.current_device() == 0:
             print("Ids:", tokenizer.decode(input_ids))
@@ -375,7 +549,33 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
         print("[" + ", ".join(to_print) + "]")
 
     def find_start_end(content, tokenizer, input_ids, attention_mask, remove_leading_newline=False):
-        """Find the start and end index of the content in the input_ids."""
+        """Find the (start-1, end) token indices of `content` inside
+        `input_ids`, searched right-to-left.
+
+        Two matching strategies, tried in order:
+
+        1. **Fast path (original)**: per-token list equality between
+           ``[decode(t) for t in tokens(content)]`` and the corresponding
+           slice of ``[decode(t) for t in input_ids]``. Works on all BPE
+           tokenizers whose per-token decode preserves enough
+           information for list equality (Llama-3, Qwen3, OLMo-2, most
+           DeepSeek, and Llama-2 when the standalone and in-context
+           tokenizations agree).
+
+        2. **Decode-on-slice fallback**: for Llama-2 SentencePiece (used
+           by OpenELM via the Llama-2 tokenizer override) and other
+           tokenizers with context-dependent merges (e.g. 'People'
+           tokenises as one piece inside the chat template but as
+           'Pe'+'ople' when ``content`` is encoded standalone), the
+           per-token list equality silently fails at the merge boundary.
+           We instead compare
+           ``tokenizer.decode(input_ids[i:i+L]).strip()``
+           against ``tokenizer.decode(tokens(content)).strip()``, which
+           is tokenizer.decode's actual inverse semantics (spaces
+           reconstructed across token boundaries). We sweep ``L`` in a
+           small window around ``len(tokens)`` so a single extra or
+           missing merge cannot push the fallback past its budget.
+        """
         tokens = tokenizer.encode(content, add_special_tokens=False)
         if remove_leading_newline:
             if "apple/OpenELM" in model_name:
@@ -388,19 +588,46 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             print_indexed_array(tokens)
             print_indexed_array(decoded_input)
             print_indexed_array(input_ids)
-        for i in range(len(input_ids) - len(tokens), -1, -1):
+        N = len(tokens)
+        # Fast path: per-token list equality.
+        for i in range(len(input_ids) - N, -1, -1):
             if debug == 12 and torch.cuda.current_device() == 0:
-                print(f"=======input_ids: {input_ids[i:i+len(tokens)]}")
+                print(f"=======input_ids: {input_ids[i:i+N]}")
                 print(f"assistant_tokens: {tokens}")
-            # if attention_mask[i] == 1 and input_ids[i:i+len(assistant_tokens)] == assistant_tokens:
-            if attention_mask[i] == 1 and decoded_input[i:i+len(tokens)] == decoded_content:
-                # Unmask the assistant response tokens
+            if attention_mask[i] == 1 and decoded_input[i:i + N] == decoded_content:
                 if debug == 12 and torch.cuda.current_device() == 0:
-                    print(f"start: {i}, end: {i + len(tokens) - 1}")
+                    print(f"start: {i}, end: {i + N - 1}")
                 if debug == 12:
                     exit(0)
                 assert i > 0
-                return i - 1, i + len(tokens) - 1
+                return i - 1, i + N - 1
+
+        # Fallback: decode-on-slice string match with a small token-count
+        # window. This handles SentencePiece-style losses of the leading-
+        # space marker on per-token decode, and context-dependent BPE
+        # merges where a substring tokenises to +-k tokens more/fewer
+        # in-context than standalone. Window radius of 4 is picked so
+        # that a run of a few consecutive merge flips is still recovered
+        # without meaningfully widening the search surface.
+        if N > 0:
+            target = tokenizer.decode(tokens).strip()
+            if target:
+                S = len(input_ids)
+                lo_delta = max(1 - N, -4)
+                hi_delta = 4
+                for i in range(S - 1, 0, -1):
+                    if attention_mask[i] != 1:
+                        continue
+                    for delta in range(lo_delta, hi_delta + 1):
+                        L = N + delta
+                        if L <= 0 or i + L > S:
+                            continue
+                        if attention_mask[i + L - 1] != 1:
+                            continue
+                        if tokenizer.decode(input_ids[i:i + L]).strip() == target:
+                            if debug == 12 and torch.cuda.current_device() == 0:
+                                print(f"[fallback] start: {i}, end: {i + L - 1}  (delta={delta})")
+                            return i - 1, i + L - 1
 
         assert False, f"Cannot find {content} in input {input_ids}"
         return None, None
@@ -409,7 +636,8 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
     tokenized_dataset = dataset.map(
         tokenize_conversations,
         batched=True,
-        remove_columns=dataset.column_names
+        remove_columns=dataset.column_names,
+        load_from_cache_file=False,
     )
     
     return tokenized_dataset
@@ -539,6 +767,47 @@ def set_seeds(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def _lora_target_modules(model_name):
+    """Return the LoRA target_modules list appropriate for `model_name`.
+
+    PEFT matches `target_modules` by substring against the full parameter
+    path, so the Llama-family names ``q_proj/k_proj/v_proj/o_proj`` and the
+    SwiGLU ``gate_proj/up_proj/down_proj`` will miss any architecture that
+    names its attention/MLP modules differently. The hard-coded list
+    silently produces a zero-adapter model (or raises
+    ``ValueError: Target modules ... not found``) on non-Llama
+    architectures; this helper keeps that list correct per family.
+
+    Covered families (tested in this repo):
+      * meta-llama/Llama-3.*            -> q/k/v/o + gate/up/down  (SwiGLU)
+      * google/gemma-2-*                -> same names as Llama
+      * allenai/OLMo-2-*                -> same names as Llama
+      * Qwen/Qwen3-*                    -> same names as Llama
+      * deepseek-ai/DeepSeek-R1-Distill-* (Qwen or Llama backbone) -> same
+      * apple/OpenELM-*                 -> qkv_proj / out_proj /
+                                           proj_1 / proj_2  (fused QKV + GLU)
+      * microsoft/phi-1* / phi-2        -> Wqkv / out_proj / fc1 / fc2
+
+    If you add a new family, add its entry here rather than editing the
+    LoraConfig call site.
+    """
+    if "apple/OpenELM" in model_name:
+        # OpenELM uses a fused QKV projection (`qkv_proj`), a single output
+        # projection (`out_proj`), and a SwiGLU MLP with two stages
+        # (`proj_1` -> activation -> `proj_2`). `proj_1`/`proj_2` are
+        # unique to the FFN block in this arch, so they do not collide
+        # with other modules.
+        return ["qkv_proj", "out_proj", "proj_1", "proj_2"]
+    if "microsoft/phi-1" in model_name or "microsoft/phi-2" in model_name:
+        # Phi-1 / Phi-1.5 / Phi-2 use a fused QKV (`Wqkv`) + `out_proj`
+        # attention and an `fc1`/`fc2` MLP.
+        return ["Wqkv", "out_proj", "fc1", "fc2"]
+    # Llama, Gemma-2, OLMo-2, Qwen3, DeepSeek-R1-Distill-{Qwen,Llama} all
+    # share the Llama-family naming convention.
+    return ["q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"]
+
+
 def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=False, debug=0, seed=None, linear_predictor=False, load_lp=False):
     """Setup model and tokenizer with optional LoRA"""
     
@@ -646,7 +915,7 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
             r=lora_rank,
             lora_alpha=lora_rank * 2,
             lora_dropout=0.1,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=_lora_target_modules(model_name),
         )
         model = get_peft_model(model, lora_config)
         model.enable_input_require_grads()
@@ -701,12 +970,90 @@ class RepresentationTrainer(Trainer):
         self.random_span_layer = kwargs.pop('random_span_layer', -1)
         self.curvature_sign = kwargs.pop('curvature_sign', False)
         self.avg_encoding = kwargs.pop('avg_encoding', False)
+        # control_JEPA: Lyapunov-tube regularizer on token trajectories.
+        self.tube_gamma = float(kwargs.pop('tube_gamma', 0.9))
+        self.tube_tau = float(kwargs.pop('tube_tau', 1e-4))
+        self.control_norm = kwargs.pop('control_norm', 'd_t')
+        self.tube_log_interval = int(kwargs.pop('tube_log_interval', 50))
+        # Phase A: scale-invariant soft anchor for control_norm="d_t".
+        self.anchor_eps = float(kwargs.pop('anchor_eps', 1e-3))
+        # Phase B: evaluate Lyapunov loss on a random sub-segment per
+        # example (same distribution as STP's get_s_t) rather than the
+        # full user+assistant span. Orthogonal to --linear=random_span
+        # (which is the STP baseline on the cosine loss).
+        self.random_span_lyap = bool(kwargs.pop('random_span_lyap', False))
+        # Preserving diversity / polymorphism: decorrelate directional
+        # Enc(Text)−Enc(Code) chord residuals across the batch so rare
+        # surface forms are not squeezed into the dominant mode.
+        self.preserve_diversity = bool(kwargs.pop("preserve_diversity", False))
+        self.lambda_diversity = float(kwargs.pop("lambda_diversity", 0.01))
+        self.diversity_proj_dim = max(2, int(kwargs.pop("diversity_proj_dim", 64)))
+        self._diversity_proj = None  # lazily sized to hidden dim
+        # reach_JEPA: joint transverse-longitudinal Lyapunov-Reachability loss.
+        # V_t = alpha * ||e_t||^2 / L^2 + beta * <progress>, scale-invariant.
+        # progress_mode selects the longitudinal term:
+        #   "endpoint"      -> (1 - p_t/L)^2        (legacy, teleportation-prone)
+        #   "schedule_asym" -> max(0, tau_t - p_t/L)^2 (proposed; exogenous schedule)
+        self.reach_alpha = float(kwargs.pop('reach_alpha', 1.0))
+        self.reach_beta = float(kwargs.pop('reach_beta', 1.0))
+        self.reach_progress_mode = kwargs.pop('reach_progress_mode', 'schedule_asym')
+        # Transverse-term denominator for reach_JEPA:
+        #   "L"   -> ||e||^2 / L^2        (classic, unbounded)
+        #   "d_t" -> ||e||^2 / ||d_t||^2  (angle form = sin^2 theta, bounded)
+        # The alias linear="reach_JEPA_angle" forces "d_t" unless the caller
+        # explicitly supplied a different transverse norm (e.g. to run an
+        # ablation with "L" under the angle-alias tag).
+        _rtn_supplied = 'reach_transverse_norm' in kwargs
+        self.reach_transverse_norm = kwargs.pop('reach_transverse_norm', 'L')
+        if self.linear == "reach_JEPA_angle" and not _rtn_supplied:
+            self.reach_transverse_norm = 'd_t'
         if self.avg_encoding:
             assert not self.additive_mask, f"additive_mask cannot be set if avg_encoding is set."
             assert self.linear is None, f"linear cannot be set if avg_encoding is set."
         if self.random_span_mask:
             assert self.random_span_times == 1, f"random_span_times ({self.random_span_times}) must = 1 when random_span_mask is {self.random_span_mask}."
         assert self.jepa_l2 + self.jepa_mse <= 1, "Only one of jepa_l2 and jepa_mse can be True."
+        if self.linear == "control_JEPA":
+            if self.control_norm not in _CONTROL_VALID_NORMS:
+                raise ValueError(
+                    f"--control_norm must be one of {_CONTROL_VALID_NORMS}; "
+                    f"got {self.control_norm!r}"
+                )
+            self.lyap_tube = LyapunovControlLoss(
+                gamma=self.tube_gamma,
+                tau=self.tube_tau,
+                norm_mode=self.control_norm,
+                use_softplus=True,
+                anchor_eps=self.anchor_eps,
+            )
+            self.lyap_reach = None
+        elif self.linear in ("reach_JEPA", "reach_JEPA_angle"):
+            if self.reach_alpha < 0 or self.reach_beta < 0:
+                raise ValueError(
+                    f"--alpha and --beta must be non-negative; "
+                    f"got alpha={self.reach_alpha}, beta={self.reach_beta}"
+                )
+            if self.reach_alpha == 0 and self.reach_beta == 0:
+                raise ValueError("at least one of --alpha, --beta must be positive")
+            if self.reach_transverse_norm not in _REACH_VALID_TRANSVERSE_NORMS:
+                raise ValueError(
+                    f"--reach_transverse_norm must be one of "
+                    f"{_REACH_VALID_TRANSVERSE_NORMS}; "
+                    f"got {self.reach_transverse_norm!r}"
+                )
+            self.lyap_reach = LyapunovReachabilityLoss(
+                alpha=self.reach_alpha,
+                beta=self.reach_beta,
+                gamma=self.tube_gamma,
+                tau=self.tube_tau,
+                progress_mode=self.reach_progress_mode,
+                transverse_norm=self.reach_transverse_norm,
+                use_softplus=True,
+            )
+            self.lyap_tube = None
+        else:
+            self.lyap_tube = None
+            self.lyap_reach = None
         super().__init__(*args, **kwargs)
         rank = getattr(self.args, "process_index", 0)
         self._g = torch.Generator(device=self.args.device)
@@ -1098,6 +1445,28 @@ class RepresentationTrainer(Trainer):
         else:
             assert False, f"Unknown length_adjustment: {self.length_adjustment}."
 
+    def _lazy_diversity_proj(self, d_model: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        proj = getattr(self, "_diversity_proj", None)
+        if (
+            proj is not None
+            and proj.shape[0] == d_model
+            and proj.shape[1] == self.diversity_proj_dim
+            and proj.device == device
+            and proj.dtype == dtype
+        ):
+            return proj
+        g = torch.Generator(device=torch.device("cpu"))
+        g.manual_seed(int(getattr(self.args, "seed", 0)) + 9973)
+        w = torch.randn(
+            d_model,
+            self.diversity_proj_dim,
+            generator=g,
+            dtype=torch.float64,
+        )
+        w = F.normalize(w, p=2, dim=0, eps=1e-12)
+        self._diversity_proj = w.to(device=device, dtype=dtype).detach()
+        return self._diversity_proj
+
     def get_curvature(self, hidden_states, start, end_exclusive):
         length = end_exclusive - start
         if length > 1:
@@ -1115,6 +1484,94 @@ class RepresentationTrainer(Trainer):
                     curvature += torch.abs(angle_rad)
             return curvature, length - 1
         return 0.0, 0
+
+    def _build_lyapunov_bounds(self, bsz: int):
+        """Return (user_bounds, assistant_bounds) for the current mini-batch,
+        applying random-span sub-segmentation when ``self.random_span_lyap``
+        is set.
+
+        In the default (step-wise) mode we simply convert
+        ``self.user_start_end`` / ``self.assistant_start_end`` to the
+        inclusive-inclusive convention that ``LyapunovControlLoss`` /
+        ``LyapunovReachabilityLoss`` expect::
+
+            u_s = user_start_end[i, 0] + 1       # skip <|start_header|> etc.
+            u_e = user_start_end[i, 1]           # inclusive
+            a_s = assistant_start_end[i, 0] + 1
+            a_e = assistant_start_end[i, 1]
+
+        In random-span mode we sample a single ``(patch_start_offset,
+        patch_end_offset)`` per example from ``self.get_s_t(full_length)``
+        (using the same RNG / options as the STP baseline) and remap it
+        back into ``(u_s, u_e, a_s, a_e)`` so the Lyapunov loss only
+        sees that sub-segment. Three cases:
+
+        1. Patch entirely in user span  -> new user bounds = patch,
+           assistant bounds collapsed to ``(a_s, a_s)`` (1-token span;
+           contributes no transitions, v_geo reduces to user-patch chord).
+        2. Patch entirely in assistant  -> symmetric (user collapsed to
+           ``(u_e, u_e)``; v_user term vanishes; v_geo = assistant
+           patch chord).
+        3. Patch straddles the boundary -> new user bounds =
+           ``(patch_start_abs, u_e)`` and new assistant bounds =
+           ``(a_s, patch_end_abs)``; v_geo = user-tail chord + assistant-
+           head chord, exactly matching STP's Case C decomposition.
+
+        Degenerate examples (full_length < 2, malformed bounds) fall back
+        to the step-wise bounds to stay safe. Note: ``Lyapunov*`` already
+        handles 1-token spans by recording no transitions, so the
+        "collapsed-span" convention needs no loss-side changes.
+        """
+        user_bounds: List[Tuple[int, int]] = []
+        assistant_bounds: List[Tuple[int, int]] = []
+        for i in range(bsz):
+            us = int(self.user_start_end[i, 0].item()) + 1
+            ue = int(self.user_start_end[i, 1].item())
+            as_ = int(self.assistant_start_end[i, 0].item()) + 1
+            ae = int(self.assistant_start_end[i, 1].item())
+            u_len = max(0, ue - us + 1)
+            a_len = max(0, ae - as_ + 1)
+            full_length = u_len + a_len
+            if (not self.random_span_lyap) or full_length < 2 or u_len < 1 or a_len < 1:
+                user_bounds.append((us, ue))
+                assistant_bounds.append((as_, ae))
+                continue
+            ps_t, pe_t = self.get_s_t(full_length)
+            ps_off = int(ps_t.item()) if torch.is_tensor(ps_t) else int(ps_t)
+            pe_off = int(pe_t.item()) if torch.is_tensor(pe_t) else int(pe_t)
+            if not (0 <= ps_off < pe_off <= full_length):
+                # Pathological sample (shouldn't happen: get_s_t rejects
+                # invalid spans in its while loop), fall back to full span.
+                user_bounds.append((us, ue))
+                assistant_bounds.append((as_, ae))
+                continue
+            ps_in_user = ps_off < u_len
+            # pe_off is *exclusive* in STP's convention; if pe_off == u_len
+            # the patch ends exactly on the last user token (still "in user").
+            pe_in_user = pe_off <= u_len
+            if ps_in_user:
+                ps_abs = us + ps_off
+            else:
+                ps_abs = as_ + (ps_off - u_len)
+            if pe_in_user:
+                pe_abs = us + pe_off - 1            # inclusive
+            else:
+                pe_abs = as_ + (pe_off - u_len) - 1  # inclusive
+            if ps_in_user and pe_in_user:
+                # Case B: patch entirely in user. Collapse assistant to
+                # a single valid index so v_user = patch chord, no
+                # assistant transitions.
+                user_bounds.append((ps_abs, pe_abs))
+                assistant_bounds.append((as_, as_))
+            elif (not ps_in_user) and (not pe_in_user):
+                # Case A: patch entirely in assistant. Collapse user.
+                user_bounds.append((ue, ue))
+                assistant_bounds.append((ps_abs, pe_abs))
+            else:
+                # Case C: patch straddles the user/assistant boundary.
+                user_bounds.append((ps_abs, ue))
+                assistant_bounds.append((as_, pe_abs))
+        return user_bounds, assistant_bounds
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -1211,30 +1668,151 @@ class RepresentationTrainer(Trainer):
                     if user_count + assistante_count > 0:
                         curvature[i] = (user_curvature + assistant_curvature) / (user_count + assistante_count)
                 jepa_loss = torch.mean(curvature)
+            elif self.linear == "control_JEPA":
+                # Lyapunov-tube regularizer (control_JEPA). Operates on the
+                # full-sequence hidden states; sets jepa_loss directly without
+                # producing user/assistant embeddings. Bounds are (optionally)
+                # random-span-remapped so the contraction check runs over a
+                # sub-segment sampled from STP's get_s_t (Monte Carlo over
+                # multi-scale trajectories) rather than the full span.
+                bsz = hidden_states.shape[0]
+                user_bounds, assistant_bounds = self._build_lyapunov_bounds(bsz)
+                try:
+                    chief = torch.cuda.current_device() == 0
+                except Exception:
+                    chief = True
+                want_diag = (
+                    self.tube_log_interval > 0
+                    and chief
+                    and self.state.global_step > 0
+                    and (self.state.global_step % self.tube_log_interval == 0)
+                )
+                # Diagnostics are cheap (a few reductions over already-computed
+                # tensors), so we always request them and stash on self for the
+                # downstream log payload. `want_diag` only gates the verbose
+                # stdout print.
+                jepa_loss, tube_diag = self.lyap_tube(
+                    hidden_states,
+                    user_bounds,
+                    assistant_bounds,
+                    return_diagnostics=True,
+                )
+                self._last_tube_diag = tube_diag
+                if want_diag:
+                    print(
+                        f"[control_JEPA] step={self.state.global_step} "
+                        f"norm={self.control_norm} "
+                        f"rs_lyap={int(self.random_span_lyap)} "
+                        f"anchor_eps={self.anchor_eps:.2e} "
+                        f"gamma={self.tube_gamma:.3f} tau={self.tube_tau:.2e} "
+                        f"lbd={float(self.get_lbd()):.4f} "
+                        f"mean_V={tube_diag['mean_V'].float().item():.6f} "
+                        f"raw_viol={tube_diag['mean_raw_violation'].float().item():+.4f} "
+                        f"viol_rate={tube_diag['viol_rate'].float().item():.3f} "
+                        f"L_tube={jepa_loss.detach().float().item():.5f} "
+                        f"lm_loss={lm_loss.detach().float().item():.5f} "
+                        f"total={float(self.gamma * lm_loss.detach().float().item() + self.get_lbd() * jepa_loss.detach().float().item()):.5f} "
+                        f"num_valid={int(tube_diag['num_valid'].item())}",
+                        flush=True,
+                    )
+            elif self.linear in ("reach_JEPA", "reach_JEPA_angle"):
+                # Lyapunov-Reachability: composite transverse (alpha * V_\perp)
+                # + longitudinal (beta * <progress>) Lyapunov with the same
+                # softplus contraction surrogate. V_\perp denominator chosen
+                # by self.reach_transverse_norm ("L" or "d_t" / angle form).
+                # Random-span sub-segmentation applies only to reach_JEPA for
+                # now; reach_JEPA_angle is kept step-based while its d_t
+                # regression is being diagnosed separately.
+                bsz = hidden_states.shape[0]
+                if self.linear == "reach_JEPA_angle" and self.random_span_lyap:
+                    # Explicit fall-back so users who pass --random_span_lyap
+                    # with reach_JEPA_angle don't silently get the remapping.
+                    user_bounds, assistant_bounds = [], []
+                    for i in range(bsz):
+                        us = int(self.user_start_end[i, 0].item()) + 1
+                        ue = int(self.user_start_end[i, 1].item())
+                        as_ = int(self.assistant_start_end[i, 0].item()) + 1
+                        ae = int(self.assistant_start_end[i, 1].item())
+                        user_bounds.append((us, ue))
+                        assistant_bounds.append((as_, ae))
+                else:
+                    user_bounds, assistant_bounds = self._build_lyapunov_bounds(bsz)
+                try:
+                    chief = torch.cuda.current_device() == 0
+                except Exception:
+                    chief = True
+                want_diag = (
+                    self.tube_log_interval > 0
+                    and chief
+                    and self.state.global_step > 0
+                    and (self.state.global_step % self.tube_log_interval == 0)
+                )
+                jepa_loss, reach_diag = self.lyap_reach(
+                    hidden_states,
+                    user_bounds,
+                    assistant_bounds,
+                    return_diagnostics=True,
+                )
+                self._last_reach_diag = reach_diag
+                if want_diag:
+                    _tau_mean = reach_diag.get("mean_tau")
+                    _gap_mean = reach_diag.get("mean_progress_gap")
+                    _lag_rate = reach_diag.get("lag_rate")
+                    _rs_active_here = (
+                        self.random_span_lyap and self.linear != "reach_JEPA_angle"
+                    )
+                    print(
+                        f"[{self.linear}] step={self.state.global_step} "
+                        f"mode={self.reach_progress_mode} "
+                        f"tv_norm={self.reach_transverse_norm} "
+                        f"rs_lyap={int(_rs_active_here)} "
+                        f"alpha={self.reach_alpha:.3f} beta={self.reach_beta:.3f} "
+                        f"gamma={self.tube_gamma:.3f} tau={self.tube_tau:.2e} "
+                        f"lbd={float(self.get_lbd()):.4f} "
+                        f"V={reach_diag['mean_V'].float().item():.4e} "
+                        f"V_trans={reach_diag['mean_V_transversal'].float().item():.4e} "
+                        f"V_prog={reach_diag['mean_V_progress'].float().item():.4e} "
+                        f"tau_t={(_tau_mean.float().item() if _tau_mean is not None else float('nan')):+.3f} "
+                        f"p/L={reach_diag['mean_p_over_L'].float().item():+.3f} "
+                        f"gap={(_gap_mean.float().item() if _gap_mean is not None else float('nan')):+.3f} "
+                        f"lag_rate={(_lag_rate.float().item() if _lag_rate is not None else float('nan')):.3f} "
+                        f"e2/L2={reach_diag['mean_e2_over_L2'].float().item():.3e} "
+                        f"raw_viol={reach_diag['mean_raw_violation'].float().item():+.4f} "
+                        f"viol_rate={reach_diag['viol_rate'].float().item():.3f} "
+                        f"L_reach={jepa_loss.detach().float().item():.5f} "
+                        f"lm_loss={lm_loss.detach().float().item():.5f} "
+                        f"total={float(self.gamma * lm_loss.detach().float().item() + self.get_lbd() * jepa_loss.detach().float().item()):.5f} "
+                        f"num_valid={int(reach_diag['num_valid'].item())}",
+                        flush=True,
+                    )
             else:
                 assert False, f"Unknown linear mode: {self.linear}."
-            if self.linear_predictor:
-                user_embedding = self.unwrap(model).linear_predictor(user_embedding)
-            if self.jepa_mse:
-                jepa_loss = torch.mean((user_embedding - assistant_embedding) ** 2)
-            elif self.linear == "curvature":
+            if self.linear in ("curvature", "control_JEPA", "reach_JEPA", "reach_JEPA_angle"):
+                # These modes set jepa_loss directly from hidden_states and
+                # do not build (user_embedding, assistant_embedding) pairs.
                 pass
             else:
-                assert not self.jepa_l2 and not self.infonce, "jepa_l2 and infonce is not implemented for random_span_mask."
-                cosine_similarity = F.cosine_similarity(user_embedding, assistant_embedding, dim=-1)
-                assert not self.jepa_l2 and not self.jepa_mse and not self.infonce, "Linear does not support l2, mse, or infonce"
-                assert cosine_similarity.shape == weights.shape, f"{cosine_similarity.shape} != {weights.shape}"
-                # jepa_loss = 1.0 - torch.mean(cosine_similarity * weights)
-                jepa_loss = 1.0 - torch.sum(cosine_similarity * weights) / torch.sum(weights)
+                if self.linear_predictor:
+                    user_embedding = self.unwrap(model).linear_predictor(user_embedding)
+                if self.jepa_mse:
+                    jepa_loss = torch.mean((user_embedding - assistant_embedding) ** 2)
+                else:
+                    assert not self.jepa_l2 and not self.infonce, "jepa_l2 and infonce is not implemented for random_span_mask."
+                    cosine_similarity = F.cosine_similarity(user_embedding, assistant_embedding, dim=-1)
+                    assert not self.jepa_l2 and not self.jepa_mse and not self.infonce, "Linear does not support l2, mse, or infonce"
+                    assert cosine_similarity.shape == weights.shape, f"{cosine_similarity.shape} != {weights.shape}"
+                    # jepa_loss = 1.0 - torch.mean(cosine_similarity * weights)
+                    jepa_loss = 1.0 - torch.sum(cosine_similarity * weights) / torch.sum(weights)
             if self.debug == 1 and torch.cuda.current_device() == 0:
                 print("start_end_index")
                 print(self.user_start_end[:, 0])
                 print(self.user_start_end[:, 1])
                 print(self.assistant_start_end[:, 0])
                 print(self.assistant_start_end[:, 1])
-                print("shape")
-                print(user_embedding.shape, assistant_embedding.shape)
-                print(cosine_similarity.shape)
+                if self.linear not in ("curvature", "control_JEPA", "reach_JEPA", "reach_JEPA_angle"):
+                    print("shape")
+                    print(user_embedding.shape, assistant_embedding.shape)
+                    print(cosine_similarity.shape)
         elif user_hidden_states is not None:
             if self.additive_mask:
                 index_user = self._last_token_user
@@ -1278,10 +1856,27 @@ class RepresentationTrainer(Trainer):
         else:
             jepa_loss = 0.0
 
-        total_loss = self.gamma * lm_loss + self.get_lbd() * jepa_loss
+        diversity_loss = lm_loss.new_zeros(())
+        if self.preserve_diversity and self.linear is not None:
+            proj = self._lazy_diversity_proj(
+                hidden_states.shape[-1], hidden_states.device, hidden_states.dtype
+            )
+            delta = chord_difference_text_minus_code(
+                hidden_states, self.user_start_end, self.assistant_start_end
+            )
+            diversity_loss = polymorphism_decorrelation_loss(delta, proj)
+
+        total_loss = (
+            self.gamma * lm_loss
+            + self.get_lbd() * jepa_loss
+            + self.lambda_diversity * diversity_loss
+        )
 
         if self.debug == 2 and torch.cuda.current_device() == 0:
-            print(lm_loss, self.get_lbd(), torch.mean(cosine_similarity))
+            if self.linear in ("curvature", "control_JEPA", "reach_JEPA", "reach_JEPA_angle"):
+                print(lm_loss, self.get_lbd(), jepa_loss)
+            else:
+                print(lm_loss, self.get_lbd(), torch.mean(cosine_similarity))
 
         if self.debug == 1 or self.debug == 2:
             exit(0)
@@ -1290,6 +1885,110 @@ class RepresentationTrainer(Trainer):
             if (self.state.global_step % 10) == 0:
                 print(f"llm_loss_10: {lm_loss.float()}, jepa_loss: {jepa_loss.float()}")
             print(f"llm_loss: {lm_loss.float()}, jepa_loss: {jepa_loss.float()}")
+
+        # Emit per-component losses into trainer_state.json at the trainer's
+        # native logging cadence so NTP / STP-cosine / LyapunovLoss can be
+        # plotted and compared. The key `jepa_loss` holds the STP cosine loss
+        # for linear=random_span and the LyapunovLoss for linear=control_JEPA.
+        try:
+            logging_steps = int(getattr(self.args, "logging_steps", 0) or 0)
+            if (
+                self.is_world_process_zero()
+                and logging_steps > 0
+                and self.state.global_step > 0
+                and (self.state.global_step % logging_steps == 0)
+                and getattr(self, "_last_component_log_step", -1) != self.state.global_step
+            ):
+                self._last_component_log_step = self.state.global_step
+                if torch.is_tensor(jepa_loss):
+                    jepa_scalar = float(jepa_loss.detach().float().mean().item())
+                else:
+                    jepa_scalar = float(jepa_loss)
+                payload = {
+                    "lm_loss": float(lm_loss.detach().float().mean().item()),
+                    "jepa_loss": jepa_scalar,
+                    "lbd_used": float(self.get_lbd()),
+                }
+                if self.preserve_diversity:
+                    payload["diversity_loss"] = float(
+                        diversity_loss.detach().float().mean().item()
+                    )
+                    payload["lambda_diversity"] = float(self.lambda_diversity)
+                if self.linear == "control_JEPA":
+                    payload["loss_kind"] = "lyapunov"
+                    payload["control_norm"] = self.control_norm
+                    payload["anchor_eps"] = self.anchor_eps
+                    payload["random_span_lyap"] = bool(self.random_span_lyap)
+                    td = getattr(self, "_last_tube_diag", None)
+                    if td is not None:
+                        # Geometric diagnostics: mean Lyapunov value,
+                        # contraction gap, fraction of transitions still in
+                        # violation. These are what actually move during
+                        # training; the softplus surrogate can look flat
+                        # even when geometry changes substantially.
+                        payload["mean_V"] = float(td["mean_V"].float().item())
+                        payload["raw_viol"] = float(
+                            td["mean_raw_violation"].float().item()
+                        )
+                        payload["viol_rate"] = float(td["viol_rate"].float().item())
+                elif self.linear in ("reach_JEPA", "reach_JEPA_angle"):
+                    payload["loss_kind"] = "lyapunov_reach"
+                    payload["reach_alpha"] = self.reach_alpha
+                    payload["reach_beta"] = self.reach_beta
+                    payload["progress_mode"] = self.reach_progress_mode
+                    payload["transverse_norm"] = self.reach_transverse_norm
+                    payload["linear"] = self.linear
+                    # Phase B: reflect whether random-span remapping is
+                    # actually active (reach_JEPA_angle stays step-based even
+                    # when --random_span_lyap is set).
+                    payload["random_span_lyap"] = bool(
+                        self.random_span_lyap and self.linear != "reach_JEPA_angle"
+                    )
+                    rd = getattr(self, "_last_reach_diag", None)
+                    if rd is not None:
+                        # Composite Lyapunov diagnostics: transverse
+                        # (e^2/L^2), longitudinal (progress term), plus the
+                        # schedule tau_t, the signed progress gap (tau - p/L
+                        # for schedule_asym; 1 - p/L for endpoint), and the
+                        # fraction of tokens lagging behind schedule.
+                        payload["mean_V"] = float(rd["mean_V"].float().item())
+                        payload["mean_V_trans"] = float(
+                            rd["mean_V_transversal"].float().item()
+                        )
+                        payload["mean_V_prog"] = float(
+                            rd["mean_V_progress"].float().item()
+                        )
+                        payload["mean_p_over_L"] = float(
+                            rd["mean_p_over_L"].float().item()
+                        )
+                        payload["mean_e2_over_L2"] = float(
+                            rd["mean_e2_over_L2"].float().item()
+                        )
+                        if "mean_tau" in rd:
+                            payload["mean_tau"] = float(
+                                rd["mean_tau"].float().item()
+                            )
+                        if "mean_progress_gap" in rd:
+                            payload["mean_progress_gap"] = float(
+                                rd["mean_progress_gap"].float().item()
+                            )
+                        if "lag_rate" in rd:
+                            payload["lag_rate"] = float(
+                                rd["lag_rate"].float().item()
+                            )
+                        payload["raw_viol"] = float(
+                            rd["mean_raw_violation"].float().item()
+                        )
+                        payload["viol_rate"] = float(rd["viol_rate"].float().item())
+                elif self.linear == "random_span":
+                    payload["loss_kind"] = "stp_cosine"
+                elif self.linear == "curvature":
+                    payload["loss_kind"] = "curvature"
+                else:
+                    payload["loss_kind"] = "other"
+                self.log(payload)
+        except Exception:
+            pass
 
         return (total_loss, main_outputs) if return_outputs else total_loss
 
@@ -1357,7 +2056,7 @@ def main():
     parser.add_argument("--infonce", action="store_true", help="When set, Use InfoNCE loss.")
     parser.add_argument("--same_flop", action="store_true", help="When set, Use same number of flops per epoch.")
     parser.add_argument("--jepa_ratio", type=float, default=-1.0, help="When >0, randomly select this ratio of batches to apply JEPA. This implments Random JEPA-Loss Dropout (LD). If LD = alpha, jepa_ratio = 1 - alpha")
-    parser.add_argument("--linear", type=str, default=None, help="Linear mode. Can be 'e2e', 'mean', 'random_span'.")
+    parser.add_argument("--linear", type=str, default=None, help="Linear mode. Can be 'e2e', 'mean', 'random_span', 'curvature', 'control_JEPA', 'reach_JEPA', 'reach_JEPA_angle'.")
     parser.add_argument("--plain_jepa", action="store_true", help="When set, do not apply chat format when compute JEPA loss.")
     parser.add_argument("--linear_predictor", action="store_true", help="Use a inear predictor when set to true.")
     parser.add_argument("--lbd_warmup", action="store_true", help="Linearly warmup lambda when set to True.")
@@ -1381,10 +2080,150 @@ def main():
     parser.add_argument("--avg_encoding", action="store_true", help="When set to True, use average encoding.")
     parser.add_argument("--use_default_data_collator", action="store_true", help="When set, Use `default_data_collator`.")
     parser.add_argument("--unmask_assistant_special_tokens", action="store_true", help="When set, unmask assistant special tokens.")
-
+    # control_JEPA: Lyapunov-tube regularizer on token trajectories.
+    parser.add_argument("--tube_gamma", type=float, default=0.9,
+                        help="control_JEPA: Lyapunov decay factor (V_{t+1} <= gamma V_t + tau).")
+    parser.add_argument("--tube_tau", type=float, default=1e-4,
+                        help="control_JEPA: tube slack tau.")
+    parser.add_argument("--control_norm", type=str, default="d_t",
+                        choices=list(_CONTROL_VALID_NORMS),
+                        help="control_JEPA: normalization for V_t. "
+                             "'d_model'=||e||^2/D, 'v_geo'=||e||^2/||v_geo||^2, "
+                             "'d_t'=||e||^2/||d_t||^2 (sin^2 angle).")
+    parser.add_argument("--tube_log_interval", type=int, default=50,
+                        help="control_JEPA: print tube diagnostics every N optimizer steps (0=off).")
+    parser.add_argument("--lbd_control", type=float, default=None,
+                        help="control_JEPA: weight on LyapunovLoss. If set, overrides --lbd "
+                             "when --linear=control_JEPA. Keeps --lbd free for the STP cosine "
+                             "baseline weight so the two can be swept independently.")
+    # reach_JEPA: joint transverse-longitudinal Lyapunov-Reachability regularizer.
+    # V_t = alpha * ||e_t||^2 / L^2 + beta * (1 - p_t/L)^2 . Both terms are
+    # scale-invariant so rule out the d_model-style clustering collapse by
+    # construction. Setting beta=0 recovers a pure tube; alpha=0 is a
+    # progress-only ablation.
+    parser.add_argument("--alpha", type=float, default=1.0,
+                        help="reach_JEPA: weight on transverse term ||e||^2/L^2.")
+    parser.add_argument("--beta", type=float, default=1.0,
+                        help="reach_JEPA: weight on progress-deficit term (1-p/L)^2.")
+    parser.add_argument("--lbd_reach", type=float, default=None,
+                        help="reach_JEPA: weight on LyapunovReachabilityLoss. If set, "
+                             "overrides --lbd when --linear=reach_JEPA.")
+    parser.add_argument("--progress_mode", type=str, default="schedule_asym",
+                        choices=["endpoint", "schedule_asym"],
+                        help="reach_JEPA: longitudinal Lyapunov term. "
+                             "'schedule_asym'=max(0, tau_t - p_t/L)^2 (proposed; "
+                             "structural token-rank schedule, teleportation-proof). "
+                             "'endpoint'=(1 - p_t/L)^2 (legacy; teleportation-prone, "
+                             "kept for ablations).")
+    parser.add_argument("--reach_transverse_norm", type=str, default=None,
+                        choices=list(_REACH_VALID_TRANSVERSE_NORMS),
+                        help="reach_JEPA: transverse-term denominator. "
+                             "'L' = ||e||^2/L^2 (classical, unbounded). "
+                             "'d_t' = ||e||^2/||d_t||^2 = sin^2 theta_t (angle form; "
+                             "bounded in [0,1], rotation-invariant; anchors masked). "
+                             "If omitted, defaults to 'd_t' when --linear=reach_JEPA_angle "
+                             "and 'L' otherwise.")
+    # ---- anchor_eps (Phase A): scale-invariant soft gate for d_t norm ------
+    # The LyapunovControlLoss d_t mode used a hard ||d_t||^2 >= 1e-8 clamp
+    # that broke scale invariance (see lyapunov_loss.py:LyapunovControlLoss
+    # docstring). --anchor_eps replaces that clamp with a soft gate
+    # V_t = ||e_t||^2 / (anchor_eps * L^2 + ||d_t||^2). Default 1e-3 is
+    # ablation-safe: tokens far from the anchor still behave as sin^2 theta,
+    # tokens close to it gracefully fall back to a Tikhonov ||e||^2/L^2.
+    # Set to 0.0 to recover legacy hard-clamp behaviour for controlled
+    # ablations. Has no effect on control_norm in {d_model, v_geo} or on
+    # the reach_JEPA_angle angle form (which still uses its own anchor
+    # mask; that will be unified in a follow-up once we've diagnosed the
+    # reach_JEPA_angle regression separately).
+    parser.add_argument("--anchor_eps", type=float, default=1e-3,
+                        help="control_JEPA (norm=d_t): soft-anchor coefficient "
+                             "in V_t = ||e||^2 / (anchor_eps * L^2 + ||d_t||^2). "
+                             "Set 0.0 for legacy hard-clamp behaviour.")
+    # ---- random_span on Lyapunov loss (Phase B) ----------------------------
+    # Instead of evaluating Lyapunov contraction on the full (user+assistant)
+    # polyline at every step, sample a random *sub-segment* per example
+    # (same distribution as STP's --linear=random_span) and enforce
+    # contraction over that segment only. Motivation: the contraction
+    # V_{t+1} <= gamma V_t + tau must hold over the full continuous
+    # trajectory by LeCun's continuous-token hypothesis (Wu/LeCun 2025,
+    # Sec. 4); step-by-step enforcement only samples the t -> t+1 scale,
+    # whereas random-span samples scales from 1 to (L-1) tokens. This is
+    # an Alg 2-style path-integral Monte Carlo estimator of the same
+    # functional, closer in spirit to LyaNet's Alg 2 than to step-wise
+    # backprop. Uses exactly the same get_s_t sampler as the STP baseline
+    # so cross-method comparisons are apples-to-apples.
+    parser.add_argument("--random_span_lyap", action="store_true",
+                        help="Evaluate control_JEPA / reach_JEPA Lyapunov "
+                             "loss on a random sub-segment per example "
+                             "(sampled from STP's get_s_t) instead of the "
+                             "full user+assistant span. No effect on "
+                             "--linear=random_span (STP baseline) or on "
+                             "reach_JEPA_angle (kept step-based for "
+                             "now; will be unified post-regression fix).")
+    parser.add_argument(
+        "--dynamics_tube",
+        action="store_true",
+        help="Runs Lyapunov Semantic Tube: forces --linear control_JEPA "
+             "(CLI alias used by compare_three_method.py).",
+    )
+    parser.add_argument(
+        "--lbd_ts",
+        type=float,
+        default=0.0,
+        help="Reserved for temporal straightening; ignored here but accepted "
+             "by compare_three_method.py subprocess calls.",
+    )
+    parser.add_argument(
+        "--preserve_diversity",
+        action="store_true",
+        help="Enable polymorphism auxiliary: decorrelation of directional "
+             "Enc(Text)−Enc(Code) chord differences across each batch.",
+    )
+    parser.add_argument(
+        "--lambda_diversity",
+        type=float,
+        default=0.01,
+        help="Weight on --preserve_diversity redundancy-reduction loss.",
+    )
+    parser.add_argument(
+        "--diversity_proj_dim",
+        type=int,
+        default=64,
+        help="Random projection dimension used by --preserve_diversity.",
+    )
 
     args = parser.parse_args()
-    
+
+    if getattr(args, "dynamics_tube", False):
+        prev = args.linear
+        args.linear = "control_JEPA"
+        if prev not in (None, "control_JEPA") and torch.cuda.current_device() == 0:
+            print(
+                f"[--dynamics_tube] overriding --linear {prev!r} with control_JEPA.",
+                flush=True,
+            )
+
+    # control_JEPA: a dedicated --lbd_control overrides --lbd so the Lyapunov
+    # weight can be swept independently of the STP cosine baseline weight.
+    if args.linear == "control_JEPA" and args.lbd_control is not None:
+        if torch.cuda.current_device() == 0:
+            print(
+                f"[control_JEPA] overriding --lbd ({args.lbd}) with "
+                f"--lbd_control ({args.lbd_control}) as LyapunovLoss weight.",
+                flush=True,
+            )
+        args.lbd = args.lbd_control
+
+    # reach_JEPA / reach_JEPA_angle: same pattern with --lbd_reach.
+    if args.linear in ("reach_JEPA", "reach_JEPA_angle") and args.lbd_reach is not None:
+        if torch.cuda.current_device() == 0:
+            print(
+                f"[{args.linear}] overriding --lbd ({args.lbd}) with "
+                f"--lbd_reach ({args.lbd_reach}) as LyapunovReachabilityLoss weight.",
+                flush=True,
+            )
+        args.lbd = args.lbd_reach
+
     # Validate arguments
     if not args.train_file and not args.data_file:
         parser.error("Must provide either --train_file or --data_file")
@@ -1413,13 +2252,49 @@ def main():
     # Check if running with torchrun
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    
+
     if world_size > 1:
-        if torch.cuda.current_device() == 0:
-            print(f"Running with torchrun: world_size={world_size}, local_rank={local_rank}")
-        # Initialize distributed training
+        # Modern torchrun (>= 2.0) remaps CUDA_VISIBLE_DEVICES per worker
+        # when it is set in the parent shell: each child sees exactly one
+        # GPU, and that GPU is always at local index 0. Older torchrun
+        # (and manual `python -m torch.distributed.launch`) leave
+        # CUDA_VISIBLE_DEVICES untouched, so each rank sees ALL GPUs and
+        # must pick its own by `local_rank`. We detect which regime we are
+        # in by counting visible devices and pick the correct device index.
+        n_gpus = torch.cuda.device_count()
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+        if n_gpus == 0:
+            raise RuntimeError(
+                "No CUDA devices visible to this process; cannot run "
+                f"distributed training. CUDA_VISIBLE_DEVICES={cvd}."
+            )
+        if n_gpus == 1:
+            # Either torchrun isolated one GPU per rank (modern behaviour
+            # when CUDA_VISIBLE_DEVICES is exported) OR the user really
+            # only has one GPU visible. In both cases the only valid
+            # device index is 0; the caller is responsible for spawning
+            # nproc_per_node == #physical_GPUs so each rank lands on a
+            # distinct physical device.
+            device_id = 0
+        elif n_gpus < world_size:
+            raise RuntimeError(
+                f"world_size={world_size} but only {n_gpus} GPU(s) visible "
+                f"(CUDA_VISIBLE_DEVICES={cvd}). Either unset "
+                "CUDA_VISIBLE_DEVICES, widen it (e.g. '0,1'), or lower "
+                "NPROC_PER_NODE to match the number of visible GPUs."
+            )
+        else:
+            device_id = local_rank % n_gpus
+        if local_rank == 0:
+            print(
+                f"Running with torchrun: world_size={world_size}, "
+                f"local_rank={local_rank}, visible_gpus={n_gpus}, "
+                f"device_id={device_id}"
+            )
+        # set_device MUST come before init_process_group so NCCL binds to
+        # the right device for this rank.
+        torch.cuda.set_device(device_id)
         torch.distributed.init_process_group(backend='nccl')
-        torch.cuda.set_device(local_rank)
     
     # Setup model and tokenizer
     if torch.cuda.current_device() == 0:
@@ -1634,6 +2509,26 @@ def main():
             random_span_layer=args.random_span_layer,
             curvature_sign=args.curvature_sign,
             avg_encoding=args.avg_encoding,
+            tube_gamma=args.tube_gamma,
+            tube_tau=args.tube_tau,
+            control_norm=args.control_norm,
+            tube_log_interval=args.tube_log_interval,
+            anchor_eps=args.anchor_eps,
+            random_span_lyap=args.random_span_lyap,
+            preserve_diversity=args.preserve_diversity,
+            lambda_diversity=args.lambda_diversity,
+            diversity_proj_dim=args.diversity_proj_dim,
+            reach_alpha=args.alpha,
+            reach_beta=args.beta,
+            reach_progress_mode=args.progress_mode,
+            # Pass only if the user explicitly set --reach_transverse_norm so
+            # that the "reach_JEPA_angle" alias can default to "d_t" inside
+            # the trainer without being overridden here.
+            **(
+                {"reach_transverse_norm": args.reach_transverse_norm}
+                if args.reach_transverse_norm is not None
+                else {}
+            ),
         )
     
     if torch.cuda.current_device() == 0 and args.lora:
@@ -1692,7 +2587,18 @@ def main():
     
     if torch.cuda.current_device() == 0:
         print(f"\n✅ Training completed! Model saved to {args.output_dir}")
-    
+
+    # Save NTP / STP-cosine / LyapunovLoss curves to <output_dir>/loss_curves.png.
+    # Best-effort: never fail training just because matplotlib is missing or a
+    # log_history key is unexpected.
+    if torch.cuda.current_device() == 0:
+        try:
+            from plot_training_curves import plot_training_curves
+            fig_path = plot_training_curves(output_dir)
+            print(f"📈 Saved loss curves: {fig_path}")
+        except Exception as _plot_e:
+            print(f"(plot_training_curves skipped: {_plot_e})")
+
     if torch.cuda.current_device() == 0:
         print("\n🎉 Fine-tuning finished successfully!")
 

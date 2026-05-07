@@ -1,0 +1,47 @@
+## Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+## Cursor / editors
+.cursor/
+.vscode/
+
+## OS junk
+__MACOSX/
+.DS_Store
+
+## Outputs / artifacts (keep repo code-only)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.pdf
+*.txt
+*.log
+*.zip
+
+## Data dumps
+*.jsonl
+*.json
+*.csv
+
+## Large model / checkpoint folders seen in this repo
+Llama3.2-1B-Instruct/
+OpenELM-1_1B-Instruct/
+gemma-2-2b-it/
+llm-jepa/
+
+## Dataset folders
+spider_data/
+
+## Common run output dirs
+results/
+logs/
+

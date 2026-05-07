@@ -23,6 +23,8 @@ import logging
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 
+from synth_metrics import synth_engineering_relaxed_match
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,6 +35,35 @@ torch.set_float32_matmul_precision('high')
 import warnings
 
 warnings.filterwarnings("ignore", message="The following generation flags are not valid")
+
+# ---------------------------------------------------------------------------
+# galilai-group/llm-jepa `evaluate.py` defaults (OpenReview / GitHub lineage).
+# Use `--eval_profile llm_jepa_official` to force these for apples-to-apples
+# comparison with the upstream repo, overriding per-dataset caps from shell.
+# Ref: https://github.com/galilai-group/llm-jepa/blob/main/evaluate.py (argparse defaults).
+# ---------------------------------------------------------------------------
+LLM_JEPA_OFFICIAL_MAX_NEW_TOKENS = 128
+LLM_JEPA_OFFICIAL_MAX_LENGTH = 512
+
+VALID_EVAL_PROFILES = ("fork", "llm_jepa_official")
+
+
+def apply_eval_profile(args: argparse.Namespace) -> None:
+    """Mutate generation-related fields on `args` when matching official LLM-JEPA eval."""
+    profile = getattr(args, "eval_profile", "fork")
+    if profile == "llm_jepa_official":
+        args.max_length = LLM_JEPA_OFFICIAL_MAX_LENGTH
+        args.max_new_tokens = LLM_JEPA_OFFICIAL_MAX_NEW_TOKENS
+        print(
+            "[eval_profile=llm_jepa_official] "
+            f"max_new_tokens={args.max_new_tokens}, max_length={args.max_length} "
+            "(galilai-group/llm-jepa evaluate.py defaults; shell caps ignored).",
+            flush=True,
+        )
+    elif profile != "fork":
+        raise ValueError(
+            f"eval_profile must be one of {VALID_EVAL_PROFILES}; got {profile!r}"
+        )
 
 
 # def use_llama_3_2_chat_template(tokenizer):
@@ -458,18 +489,34 @@ spider_pattern = re.compile(r"For db_id:\[(.+)\]")
 
 
 def spider_eval(generated, ground_truth, spider_path, debug=0):
+    # Faithful to the STP paper's original spider_eval: pass raw generated SQL
+    # straight to sqlite3 and compare stdout == stdout. No _truncate_sql, no
+    # empty-gt guard (the paper counts empty==empty as a match).
+    #
+    # We retain two *defensive* safety rails that do NOT change behavior when
+    # spider_data is present and healthy:
+    #   (a) missing-dbfile guard: prevents a silent 100% if someone forgets to
+    #       unzip spider_data.zip (both subprocess calls would return "").
+    #   (b) subprocess timeout: prevents a runaway query from hanging the sweep.
     db_id = re.search(spider_pattern, ground_truth[1]["content"])
     assert db_id
     db_id = db_id.group(1)
     dbfile = os.path.join(spider_path, db_id, db_id + '.sqlite')
 
+    if not os.path.exists(dbfile):
+        if debug == 1:
+            print(f"[SPIDER] missing dbfile: {dbfile}")
+        return False
+
     try:
-        result = subprocess.run(["sqlite3", dbfile, generated], capture_output=True, text=True)
+        result = subprocess.run(["sqlite3", dbfile, generated],
+                                capture_output=True, text=True, timeout=10)
         gen_result = result.stdout
 
-        result = subprocess.run(["sqlite3", dbfile, ground_truth[2]["content"]], capture_output=True, text=True)
+        result = subprocess.run(["sqlite3", dbfile, ground_truth[2]["content"]],
+                                capture_output=True, text=True, timeout=10)
         gt_result = result.stdout
-    except:
+    except Exception:
         return False
 
     if debug == 1:
@@ -480,6 +527,43 @@ def spider_eval(generated, ground_truth, spider_path, debug=0):
 
 
 gsm8k_pattern = re.compile(r"\n#### (.+)$")
+# Relaxed pattern: accept any "#### <answer>" occurrence; we take the LAST one.
+gsm8k_pattern_relaxed = re.compile(r"####\s*([^\s#]+)")
+
+
+def _normalize_gsm8k_answer(s):
+    """Strip commas, $, and trailing punctuation so '1,234.' matches '1234'."""
+    if s is None:
+        return None
+    s = s.strip().rstrip(".").rstrip(",").rstrip(")")
+    s = s.replace(",", "").replace("$", "").replace(" ", "")
+    return s
+
+
+def _dataset_kind(input_file):
+    """Identify dataset by basename so `datasets/gsm8k_test.jsonl` routes to the gsm8k branch."""
+    base = os.path.basename(input_file or "").lower()
+    for key in ("gsm8k", "spider", "nq_open", "rotten_tomatoes", "hellaswag", "synth", "turk"):
+        if base.startswith(key):
+            return key
+    return "generic"
+
+
+# Standard open-domain QA normalization (SQuAD / NQ-Open convention): lowercase,
+# strip articles "a/an/the", strip punctuation, collapse whitespace. Used for
+# nq_open's "gt appears in gen" containment check.
+_NQ_ARTICLES = re.compile(r"\b(a|an|the)\b", flags=re.IGNORECASE)
+_NQ_PUNCT = re.compile(r"[^\w\s]")
+
+
+def _normalize_nq_open(s):
+    if s is None:
+        return ""
+    s = s.lower()
+    s = _NQ_PUNCT.sub(" ", s)
+    s = _NQ_ARTICLES.sub(" ", s)
+    s = " ".join(s.split())
+    return s
 
 
 def eval(generated, ground_truth, input_file, spider_path, startswith=False, debug=0):
@@ -490,33 +574,120 @@ def eval(generated, ground_truth, input_file, spider_path, startswith=False, deb
             print("-----startswith-----")
         return generated.startswith(ground_truth[2]["content"])
 
-    if input_file.startswith("gsm8k"):
-        gt_match = re.search(gsm8k_pattern, ground_truth[2]["content"])
-        gt_answer = None if not gt_match else gt_match.group(1)
-        gen_match = re.search(gsm8k_pattern, generated)
-        gen_answer = None if not gen_match else gen_match.group(1)
+    kind = _dataset_kind(input_file)
+
+    if kind == "gsm8k":
+        # GT may end with a trailing newline / whitespace after `#### X`; generation may trail with
+        # more reasoning after the answer. Use findall and take the LAST `#### X` occurrence.
+        gt_matches = gsm8k_pattern_relaxed.findall(ground_truth[2]["content"])
+        gen_matches = gsm8k_pattern_relaxed.findall(generated)
+        gt_answer = _normalize_gsm8k_answer(gt_matches[-1]) if gt_matches else None
+        gen_answer = _normalize_gsm8k_answer(gen_matches[-1]) if gen_matches else None
         if debug == 1:
             print("[RAW]", generated)
             print("[GEN]", gen_answer)
             print("[GT:]", gt_answer)
             print("-----GSM8K-----")
+        if gt_answer is None:
+            return False
         return gt_answer == gen_answer
 
-    if input_file.startswith("spider"):
+    if kind == "spider":
         return spider_eval(generated, ground_truth, spider_path, debug=debug)
-    
-    if input_file.startswith("nq_open"):
-        answer_list = generated.split("; ")
-        for answer in answer_list:
-            if answer in ground_truth[2]["content"]:
+
+    if kind == "nq_open":
+        # Standard open-domain QA: the gold short answer should appear in the
+        # generation (after normalization: lowercase, strip articles + punct).
+        # The previous direction (`gen-fragment in gt`) was backwards and
+        # systematically under-counted correct answers like
+        #   gen="The answer is Vancouver."  gt="Vancouver".
+        # GT may contain multiple acceptable answers separated by "; ".
+        gen_n = _normalize_nq_open(generated)
+        gt_raw = ground_truth[2]["content"]
+        candidates = [g.strip() for g in gt_raw.split("; ") if g.strip()] or [gt_raw]
+        for cand in candidates:
+            cand_n = _normalize_nq_open(cand)
+            if cand_n and cand_n in gen_n:
+                if debug == 1:
+                    print("[GEN]", gen_n[:120])
+                    print("[GT:]", cand_n)
+                    print("-----nq_open HIT-----")
+                return True
+        if debug == 1:
+            print("[GEN]", gen_n[:120])
+            print("[GT:]", [_normalize_nq_open(c) for c in candidates])
+            print("-----nq_open MISS-----")
+        return False
+
+    if kind == "hellaswag":
+        # 4-way multiple choice. `relative_probability` (triggered by the
+        # basename-based hellaswag router upstream) already returns one of
+        # {"A","B","C","D"}. Ground truth is the single-letter answer.
+        gt = ground_truth[2]["content"].strip().upper()
+        gen = (generated or "").strip().upper()
+        # Be defensive in case a free-form generator slipped through: take
+        # the first letter in {A,B,C,D}.
+        first = next((c for c in gen if c in "ABCD"), "")
+        if debug == 1:
+            print("[GEN]", first, "(from:", gen[:80], ")")
+            print("[GT:]", gt)
+            print("-----hellaswag-----")
+        return first == gt
+
+    if kind == "turk":
+        gt = ground_truth[2]["content"]
+        gen = (generated or "").strip()
+        if debug == 1:
+            print("[GEN]", gen)
+            print("[GT:]", gt)
+            print("-----turk-----")
+        if gen == gt:
+            return True
+        if gen.startswith(gt):
+            remainder = gen[len(gt):]
+            if not remainder or not remainder[0].isalnum():
                 return True
         return False
 
+    if kind == "rotten_tomatoes":
+        # Single-token label ("Good"/"Bad"). Model often starts with the label and keeps talking,
+        # so compare only the first whitespace-separated token (case-insensitive, stripped of punct).
+        gt = ground_truth[2]["content"].strip()
+        gen = generated.strip()
+        first = gen.split()[0] if gen else ""
+        first = first.rstrip(".,!?:;\"'").strip()
+        if debug == 1:
+            print("[GEN]", first, "(from:", gen[:80], ")")
+            print("[GT:]", gt)
+            print("-----rotten_tomatoes-----")
+        return first.lower() == gt.lower()
+
+    if kind == "synth":
+        # LLM-JEPA / STP paper synth: exact string match on stripped generation and gold
+        # (same semantics as galilai-group/llm-jepa evaluate.py default branch for non-gsm8k/spider/nq).
+        gt = (ground_truth[2]["content"] or "").strip()
+        gen = (generated or "").strip()
+        if debug == 1:
+            print("[GEN]", repr(gen))
+            print("[GT:]", repr(gt))
+            print("-----synth (paper / upstream strict)-----")
+        return gen == gt
+
+    # Default: generic / unknown JSONL. Lenient prefix match for models that
+    # emit the correct answer then ramble (OpenELM/Llama-2); not used for synth.
+    gt = ground_truth[2]["content"]
+    gen = (generated or "").strip()
     if debug == 1:
-        print("[GEN]", generated)
-        print("[GT:]", ground_truth[2]["content"])
+        print("[GEN]", gen)
+        print("[GT:]", gt)
         print("-----")
-    return generated == ground_truth[2]["content"]
+    if gen == gt:
+        return True
+    if gen.startswith(gt):
+        remainder = gen[len(gt):]
+        if not remainder or not remainder[0].isalnum():
+            return True
+    return False
 
 
 def process_dataset(input_file, output_file, original_model_name, model, tokenizer, 
@@ -533,7 +704,14 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
         raise ValueError("Only JSONL files are supported")
     
     print(f"Loaded {len(dataset)} examples from {input_file}")
-    
+    if os.path.basename(input_file or "").lower().startswith("synth"):
+        print(
+            "[synth] Strict EM (paper/upstream): stripped(gen)==stripped(gt). "
+            "Also prints SYNTH engineering-relaxed rate (prefix+non-alnum boundary). "
+            "Use --eval_profile llm_jepa_official for HF gen defaults (max_new_tokens=128, max_length=512).",
+            flush=True,
+        )
+
     # Limit examples if specified
     if max_examples:
         dataset = dataset.select(range(min(max_examples, len(dataset))))
@@ -560,6 +738,10 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
     sim_list = []
     sim_list_startswith = []
     sim_list_untune = []
+
+    synth_eng_hits = 0
+    synth_eng_relaxed_only = 0
+    synth_n = 0
 
     embedding_list = []
     label_list = []
@@ -622,8 +804,21 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
                 if split_tune_untune:
                     full_messages = get_messages(original_model_name, messages)
                     prompt = format_conversation(full_messages, tokenizer, plain=plain)
-                    if input_file.startswith("hellaswag"):
-                        generated_response = relative_probability(model, tokenizer, prompt, max_length=generation_config.max_new_tokens,
+                    # Basename-based routing: --input_file often arrives as
+                    # "datasets/hellaswag_test.jsonl", so a raw startswith()
+                    # silently skipped the multiple-choice branch.
+                    if os.path.basename(input_file or "").startswith("hellaswag"):
+                        # BUG FIX: we were passing `max_new_tokens` (set to 8 by
+                        # _mnt_for_dataset("hellaswag") in run_stp.sh) as the
+                        # tokenizer `max_length`, which truncated every prompt
+                        # to its first 8 tokens. The model then scored A/B/C/D
+                        # against an empty question and collapsed to chance
+                        # (~25%), regardless of how well training had gone.
+                        # `relative_probability` needs the full *context* length
+                        # (i.e. the model's max sequence length, same as at
+                        # training time), not the generation budget.
+                        rp_max_len = getattr(generation_config, "max_length", None) or 512
+                        generated_response = relative_probability(model, tokenizer, prompt, max_length=rp_max_len,
                                                                   unmask_assistant_special_tokens=unmask_assistant_special_tokens)
                         if debug == 6:
                             print(f"<<< {prompt}")
@@ -638,6 +833,14 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
                     # if startswith:
                     #     equal = generated_response.startswith(messages[2]["content"])
                     equal = eval(generated_response, messages, input_file, spider_path, startswith=False, debug=debug)
+                    if _dataset_kind(input_file) == "synth":
+                        synth_n += 1
+                        gt_raw = messages[2]["content"]
+                        rel_ok = synth_engineering_relaxed_match(generated_response, gt_raw)
+                        if rel_ok:
+                            synth_eng_hits += 1
+                        if rel_ok and not equal:
+                            synth_eng_relaxed_only += 1
                     if startswith:
                         is_startswith = eval(generated_response, messages, input_file, spider_path, startswith=True, debug=debug)
                         if is_startswith:
@@ -666,17 +869,40 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
         print(f", {len(sim_list_startswith) / (len(sim_list) + len(sim_list_untune))}")
     else:
         print()
+
+    denom = len(sim_list) + len(sim_list_untune)
+    if synth_n > 0 and denom == synth_n:
+        er = synth_eng_hits / synth_n
+        print(
+            f"SYNTH_relaxed_engineering: {model_name}, {er:.6f}  ({synth_eng_hits}/{synth_n})",
+            flush=True,
+        )
+        print(
+            f"SYNTH_relaxed_only_vs_strict: {model_name}, {synth_eng_relaxed_only}/{synth_n} "
+            "(count where relaxed holds but strict EM fails)",
+            flush=True,
+        )
+    elif synth_n > 0:
+        print(
+            f"[synth-metrics] WARN: synth_n={synth_n} vs total scored={denom} — skip dual-summary",
+            flush=True,
+        )
+
     print(len(sim_list))
     if sim_list:
         print(sum(sim_list) / len(sim_list), np.std(sim_list))
-    quantiles = np.quantile(sim_list, [0.1, 0.2, 0.5, 0.8, 0.9])
-    print(quantiles)
+        quantiles = np.quantile(sim_list, [0.1, 0.2, 0.5, 0.8, 0.9])
+        print(quantiles)
+    else:
+        print("(sim_list is empty — skipping quantiles)")
     if split_tune_untune:
         print(len(sim_list_untune))
         if sim_list_untune:
             print(sum(sim_list_untune) / len(sim_list_untune), np.std(sim_list_untune))
-        quantiles_fail = np.quantile(sim_list_untune, [0.1, 0.2, 0.5, 0.8, 0.9])
-        print(quantiles_fail)
+            quantiles_fail = np.quantile(sim_list_untune, [0.1, 0.2, 0.5, 0.8, 0.9])
+            print(quantiles_fail)
+        else:
+            print("(sim_list_untune is empty — skipping quantiles)")
     return results
 
 
@@ -715,6 +941,18 @@ def main():
     # Generation arguments
     parser.add_argument("--max_new_tokens", type=int, default=128, help="Maximum new tokens to generate. Use -1 to unset.")
     parser.add_argument("--max_length", type=int, default=512, help="Maximum total sequence length")
+    parser.add_argument(
+        "--eval_profile",
+        type=str,
+        default="fork",
+        choices=list(VALID_EVAL_PROFILES),
+        help=(
+            "fork: honor --max_new_tokens/--max_length from CLI/shell (e.g. run_stp.sh "
+            "per-dataset caps). llm_jepa_official: force galilai-group/llm-jepa defaults "
+            f"(max_new_tokens={LLM_JEPA_OFFICIAL_MAX_NEW_TOKENS}, "
+            f"max_length={LLM_JEPA_OFFICIAL_MAX_LENGTH}) for apples-to-apples comparison."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=1.0, help="Top-p (nucleus) sampling")
     parser.add_argument("--top_k", type=int, default=1, help="Top-k sampling")
@@ -733,12 +971,15 @@ def main():
     parser.add_argument("--t_sne_type", type=str, default=None, help="The t-SNE type, can be `in_n_out`, `paraphrase`, or`rotten_tomatoes`.")
     parser.add_argument("--startswith", action="store_true", help="Wither to report match if generated starts with ground-truth.")
     parser.add_argument("--plain", action="store_true", help="When set, do not apply chat format, and append `<|perception|>` to the prompt.")
-    parser.add_argument("--spider_path", type=str, default="", help="Path to spider databases.")
+    parser.add_argument("--spider_path", type=str, default="/project/khanhnt/control_theory/test/llm-jepa/spider_data", help="Path to spider databases.")
     parser.add_argument("--unmask_assistant_special_tokens", action="store_true", help="When set, unmask assistant special tokens. Should match the training configuration.")
 
     
     args = parser.parse_args()
-    
+    if args.max_new_tokens == -1:
+        args.max_new_tokens = None
+    apply_eval_profile(args)
+
     # Validate arguments
     if not args.nosplit_data and not args.input_file and not (args.train_file and args.test_file):
         parser.error("When not using --nosplit_data, you must specify either --input_file or both --train_file and --test_file")
@@ -757,8 +998,6 @@ def main():
         print(f"Output: {args.output_file}")
     
     print(f"Max examples: {args.max_examples or 'All'}")
-    if args.max_new_tokens == -1:
-        args.max_new_tokens = None
     print(f"Max new tokens: {args.max_new_tokens}")
     print(f"Temperature: {args.temperature}")
     print(f"Top-p: {args.top_p}")
