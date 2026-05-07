@@ -33,25 +33,6 @@ surrogate
 The linear-softplus form avoids the ``1/(gamma V + tau)`` singularity of the
 log-residual surrogate and gives bounded, well-behaved gradients even near
 the constraint boundary.
-
-Control-theory framing
-----------------------
-Treating the decoder as a discrete-time plant with state ``h_t`` driven by
-token inputs, the secant direction ``v_geo`` is the target 1-D center
-manifold connecting the prompt anchor to the answer anchor. The transverse
-coordinate ``e_t`` measures deviation from this manifold. The constraint
-``V_{t+1} <= gamma V_t + tau`` is an ISS-flavored discrete Lyapunov
-contraction on the transverse subsystem with disturbance bound ``tau``
-(Khalil Ch.4; Wiggins Ch.2), which is *orthogonal* to the NTP
-cross-entropy objective: NTP specifies *what* token to emit, the Lyapunov
-tube specifies *how* the hidden trajectory should approach the answer
-manifold.
-
-References
-----------
-- Khalil, *Nonlinear Systems*, 3rd ed., ch. 4 (ISS / input-to-state stability).
-- Wiggins, *Introduction to Applied Nonlinear Dynamical Systems and Chaos*
-  (Ch. 1-2, Lyapunov functions on discrete maps).
 """
 
 from __future__ import annotations
