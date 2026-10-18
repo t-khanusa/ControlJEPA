@@ -6,11 +6,29 @@ Training entry point shared by all methods in the paper:
 * ``--linear=random_span``      Semantic Tube Prediction (STP),
 * ``--linear=control_JEPA``     ControlJEPA, NTP + lambda * Lyapunov Tube Loss.
 
-Experimental variants that are not part of the paper are also available:
-``--linear=reach_JEPA`` / ``reach_JEPA_angle`` (Lyapunov-Reachability loss,
-see ``reachability_loss.py``), ``--random_span_lyap`` (Lyapunov loss on random
-sub-segments) and the stop-decision supervision ``--supervise_eos`` /
-``--eos_ce_weight`` (gated per dataset by ``--eos_cure``).
+Options that are not part of the paper (see ``python stp.py --help``):
+
+* ``--linear=reach_JEPA``       Lyapunov-Reachability loss (``reachability_loss.py``):
+                                V_t = alpha * V_perp + beta * V_par, which adds a
+                                progress term (``--progress_mode``) to the tube.
+                                Weights ``--alpha`` / ``--beta``, loss weight ``--lbd_reach``.
+* ``--linear=reach_JEPA_angle`` the same with the angle form V_perp = ||e_t||^2 / ||d_t||^2
+                                (``--reach_transverse_norm=d_t``); always step-wise.
+* ``--random_span_lyap``        control_JEPA / reach_JEPA loss on one sub-segment per
+                                example, drawn with the STP sampler ``get_s_t``.
+* ``--supervise_eos``           unmask the label of the terminator (<|eot_id|>) that ends
+                                the answer; with the LM collator this matters for
+                                ``--regular`` (labels are kept via ``default_data_collator``).
+* ``--eos_ce_weight w``         add w * CE(terminator) at the last answer token, one term
+                                per example (``--regular`` / control_JEPA only).
+
+The terminator label is masked by default, so nothing supervises the decision to
+stop; on NL-RX-SYNTH / TURK (answers ending in a repeatable atom such as ``.*``)
+this shows up as over-generation. The two EOS flags are therefore gated per
+dataset: ``--eos_cure=auto`` (default) keeps them only when the train file's
+dataset is listed in ``--eos_cure_datasets`` (default ``synth,turk``); ``on``
+forces and ``off`` drops them. ``scripts/common.sh`` passes
+``--supervise_eos --eos_ce_weight=2`` to control_JEPA and relies on this gate.
 """
 
 from __future__ import annotations

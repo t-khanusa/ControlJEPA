@@ -135,7 +135,6 @@ The ablations show that both design choices matter:
 ```text
 ControlJEPA/
 ├── lyapunov_loss.py     # Lyapunov Tube Loss (self-contained, depends only on PyTorch)
-├── reachability_loss.py # Experimental Lyapunov-Reachability loss (reach_JEPA, not in the paper)
 ├── stp.py               # Training: NTP (--regular), STP (--linear=random_span), ControlJEPA (--linear=control_JEPA)
 ├── finetune.py          # LLM-JEPA baseline (unchanged from the official implementation)
 ├── evaluate.py          # Generation-based evaluation, shared by all methods
@@ -186,8 +185,7 @@ torchrun --nproc_per_node=2 stp.py \
   --model_name=meta-llama/Llama-3.2-1B-Instruct --finetune_seed=82 \
   --num_epochs=4 --learning_rate=2e-5 --batch_size=2 --grad_accum=4 \
   --linear=control_JEPA --last_token=-2 --predictors=0 \
-  --lbd=0.05 --tube_gamma=0.95 --tube_tau=1e-4 \
-  --supervise_eos --eos_ce_weight=2   # stop-decision supervision, active on SYNTH/TURK only (see below)
+  --lbd=0.05 --tube_gamma=0.95 --tube_tau=1e-4
 
 python evaluate.py \
   --model_name=checkpoints/controljepa-synth --original_model_name=meta-llama/Llama-3.2-1B-Instruct \
@@ -208,7 +206,6 @@ The ControlJEPA-specific flags are:
 | `--random_span_layer` | `-1` | Decoder layer whose hidden states form the trajectory |
 | `--lbd_control` | unset | Overrides `--lbd` for `control_JEPA` |
 | `--tube_log_interval` | `50` | Print a one-line diagnostics summary every N steps (`0` = off) |
-| `--supervise_eos`, `--eos_ce_weight` | off, `0` | Stop-decision supervision, see [below](#stop-decision-supervision-synth-and-turk) |
 
 ## Reproducing the paper
 
@@ -231,7 +228,7 @@ MODELS="meta-llama/Llama-3.2-3B-Instruct meta-llama/Llama-3.1-8B-Instruct" DATAS
 Each run writes `eval_result.txt` to its checkpoint directory and appends its accuracy to `results.txt`. A run whose
 `eval_result.txt` already holds a result is skipped, so an interrupted sweep can be restarted. Every hyperparameter in
 [`scripts/common.sh`](scripts/common.sh) can be overridden with an environment variable (`EPOCHS`, `LR`, `LAMBDA`,
-`GAMMA`, `TAU`, `STP_LBD`, `LLM_JEPA_LBD`, `EOS_CE_WEIGHT`, `EOS_CURE`, ...). In the paper, the baselines use their *published, dataset-tuned*
+`GAMMA`, `TAU`, `STP_LBD`, `LLM_JEPA_LBD`, ...). In the paper, the baselines use their *published, dataset-tuned*
 epochs, learning rates and loss weights. Set these through the same variables, e.g.
 `EPOCHS=... LR=... LLM_JEPA_LBD=... METHODS=llm_jepa bash scripts/run.sh`.
 
@@ -269,7 +266,7 @@ The generation budget (`--max_new_tokens`) is 96 for SYNTH and TURK, 256 for GSM
 
 ### Training diagnostics
 
-For `control_JEPA` (and `random_span`, `reach_JEPA*`) the trainer logs the following to the trainer log history every
+For `--linear=control_JEPA` the trainer logs the following to the trainer log history every
 `--eval_steps` optimiser steps (the logging interval, default 10), and prints them every `--tube_log_interval` steps:
 
 | Key | Meaning |
@@ -279,10 +276,8 @@ For `control_JEPA` (and `random_span`, `reach_JEPA*`) the trainer logs the follo
 | `viol_rate`, `raw_viol` | Fraction of transitions with $V_{t+1} > \gamma V_t + \tau$, and the mean signed innovation |
 | `mean_e_norm`, `mean_e_sq` | $\lVert e_t\rVert_2$ and $\lVert e_t\rVert_2^2$ over the trajectory |
 | `mean_v_geo_norm`, `mean_v_geo_sq` | $\lVert v_{\text{geo}}\rVert_2$ and its square (Fig. 2b) |
-| `eos_ce` | Terminator cross-entropy, when `--eos_ce_weight > 0` |
 
-For STP (`random_span`) only the geometry keys are computed, as a passive measurement of the same chord. With the
-softplus penalty, `jepa_loss` settles near $\ln 2 \approx 0.69$. This is the value of $\sigma(0)$ and is
+With the softplus penalty, `jepa_loss` settles near $\ln 2 \approx 0.69$. This is the value of $\sigma(0)$ and is
 expected: training runs in the partial-ISS regime (Sec. 4.2), where $\lVert e_t\rVert$ stays strictly positive and the
 representational capacity is kept. If `mean_v_geo_norm` collapses towards 0, the normalisation is set wrong
 (`--control_norm d_model`). If `mean_e_norm` is driven to 0, γ is too strict (Sec. 6.3).
@@ -303,53 +298,13 @@ follows:
 The benchmark is inferred from the *basename* of `--input_file`, so `datasets/gsm8k_test.jsonl` and `gsm8k_test.jsonl`
 are scored the same way. All four methods use this evaluator.
 
-### Stop-decision supervision (SYNTH and TURK)
-
-The tube constrains every content transition, but the label of the turn terminator (`<|eot_id|>`) is masked to `-100`,
-so nothing supervises the decision to stop. On NL-RX-SYNTH and NL-RX-TURK, whose answers end in a repeatable atom, the
-model then tends to keep going past the answer (e.g. a spurious trailing `.*`), which exact match counts as wrong. Two
-flags fix this in label space. Neither is part of Eq. (19).
-
-| Flag | Effect |
-| --- | --- |
-| `--supervise_eos` | Unmask only the terminator label right after the answer |
-| `--eos_ce_weight w` | Add `w · CE(terminator)` at the last answer token, one term per example, so its strength does not shrink with answer length |
-| `--eos_cure {auto,on,off}` | Per-dataset gate (default `auto`): keep the two flags only if the train file's dataset is in `--eos_cure_datasets` |
-| `--eos_cure_datasets` | Default `synth,turk` |
-
-The flags are accepted only with `--linear=control_JEPA` or `--regular`. The reference scripts pass
-`--supervise_eos --eos_ce_weight=2` to ControlJEPA on every benchmark, and the `auto` gate keeps them for SYNTH and
-TURK only. Use `EOS_CURE=off` to train with the plain Eq. (19) objective everywhere. The NTP, STP and LLM-JEPA
-baselines are trained without it. Under the default LM collator ControlJEPA's labels are rebuilt from `input_ids`, so for
-ControlJEPA the effective change comes from `--eos_ce_weight`. For `--regular` the dataset labels are kept
-(`default_data_collator`), so `--supervise_eos` also takes effect.
-
-## Experimental variants (not in the paper)
-
-These variants were explored during the project. They are kept for completeness and are **not** used for any result in
-the paper.
-
-| Flag | Variant |
-| --- | --- |
-| `--linear=reach_JEPA` | Lyapunov-Reachability loss ([`reachability_loss.py`](reachability_loss.py)): $V_t = \alpha V_\perp + \beta V_\parallel$, which adds a longitudinal progress term $V_\parallel$ to the tube |
-| `--linear=reach_JEPA_angle` | Same, with the angle form $V_\perp = \lVert e_t\rVert^2 / \lVert d_t\rVert^2$ (always step-wise) |
-| `--alpha`, `--beta` | Weights of the transverse and progress terms (default `1.0`, `1.0`) |
-| `--progress_mode` | `schedule_asym`: $\max(0, \tau_t - p_t/L)^2$ with a token-rank schedule $\tau_t$ (default); `endpoint`: $(1 - p_t/L)^2$ |
-| `--reach_transverse_norm` | `L` or `d_t` (defaults to `d_t` for `reach_JEPA_angle`, `L` otherwise) |
-| `--lbd_reach` | Overrides `--lbd` for `reach_JEPA*` |
-| `--random_span_lyap` | Evaluate the `control_JEPA` / `reach_JEPA` loss on one random sub-segment per example, drawn with the STP sampler, instead of the full user+assistant chord |
-
-```bash
-METHODS="reach_jepa reach_jepa_angle reach_jepa_rs" DATASETS=synth bash scripts/run.sh
-```
-
 ## Tests
 
 ```bash
 pytest tests/
 ```
 
-The tests check `LyapunovTubeLoss` and the experimental `LyapunovReachabilityLoss` against a per-token transcription of Eqs. (9)–(11) and (17)–(18). They also check
+The tests check `LyapunovTubeLoss` against a per-token transcription of Eqs. (9)–(11) and (17)–(18). They also check
 scale invariance, $V=0$ at the anchors, that the prompt-template gap is not penalised, the ln 2 floor of the softplus
 penalty, and the answer normalisation used by the evaluator.
 
