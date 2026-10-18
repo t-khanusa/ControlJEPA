@@ -5,6 +5,12 @@ Training entry point shared by all methods in the paper:
 * ``--regular``                 standard next-token prediction (NTP),
 * ``--linear=random_span``      Semantic Tube Prediction (STP),
 * ``--linear=control_JEPA``     ControlJEPA, NTP + lambda * Lyapunov Tube Loss.
+
+Experimental variants that are not part of the paper are also available:
+``--linear=reach_JEPA`` / ``reach_JEPA_angle`` (Lyapunov-Reachability loss,
+see ``reachability_loss.py``), ``--random_span_lyap`` (Lyapunov loss on random
+sub-segments) and the stop-decision supervision ``--supervise_eos`` /
+``--eos_ce_weight`` (gated per dataset by ``--eos_cure``).
 """
 
 from __future__ import annotations
@@ -13,7 +19,7 @@ import copy
 import math
 import numpy as np
 import os
-# import re
+import re
 import random
 import time
 import torch
@@ -37,7 +43,27 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, TaskType
 import argparse
 
-from lyapunov_loss import LyapunovTubeLoss, VALID_NORMS
+from typing import List, Tuple
+
+from lyapunov_loss import LyapunovTubeLoss, VALID_NORMS, chord_geometry_diagnostics
+from reachability_loss import LyapunovReachabilityLoss, VALID_PROGRESS_MODES, VALID_REACH_TRANSVERSE_NORMS
+
+LYAPUNOV_MODES = ("control_JEPA", "reach_JEPA", "reach_JEPA_angle")
+# Modes whose regulariser is computed directly from the trajectory (no embedding pairs).
+TRAJECTORY_MODES = ("curvature",) + LYAPUNOV_MODES
+
+
+def terminator_ids(tokenizer, include_pad=False):
+    """Token ids that can end an assistant turn (Llama-3 uses <|eot_id|>, not eos)."""
+    ids = set()
+    for tid in (tokenizer.eos_token_id, tokenizer.pad_token_id if include_pad else None):
+        if tid is not None:
+            ids.add(int(tid))
+    for name in ("<|eot_id|>", "<|end_of_text|>", "<end_of_turn>"):
+        tid = tokenizer.convert_tokens_to_ids(name)
+        if tid is not None and tid >= 0 and tid != tokenizer.unk_token_id:
+            ids.add(int(tid))
+    return ids
 
 
 def get_messages(model_name, messages):
@@ -75,9 +101,15 @@ def get_assistant_messages(model_name, dataset, messages):
 def load_and_prepare_dataset(data_file, tokenizer, model_name,
                              max_length=2048, debug=0, predictors=0, regular=False, train_all=False,
                              plain=False, front_pred=False, reverse_pred=False, linear=None, plain_jepa=False,
-                             random_span_mask=False, same_predictor=False, unmask_assistant_special_tokens=False):
+                             random_span_mask=False, same_predictor=False, unmask_assistant_special_tokens=False,
+                             supervise_eos=False):
     """Load JSONL dataset and format for training with proper label masking"""
-    
+    if regular and linear is not None:
+        raise ValueError("regular NTP cannot be combined with a linear representation mode")
+    if supervise_eos and not regular and linear != "control_JEPA":
+        raise ValueError("supervise_eos is only supported for regular NTP or control_JEPA")
+    eos_ids = terminator_ids(tokenizer)
+
     # Load dataset
     dataset = load_dataset('json', data_files=data_file)['train']
     # Route on the basename so that e.g. "datasets/hellaswag_train.jsonl" is recognised.
@@ -239,6 +271,14 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 assistant_start, assistant_end = find_start_end(messages[2]["content"], tokenizer, input_ids, attention_mask)
             assistant_start_end_list.append([assistant_start, assistant_end])
 
+            if supervise_eos:
+                # Unmask only the terminator right after the answer, so the stop decision
+                # is supervised; tokenization and every other label stay unchanged.
+                eos_pos = assistant_end + 1
+                if (eos_pos < len(input_ids) and attention_mask[eos_pos] == 1
+                        and input_ids[eos_pos] in eos_ids):
+                    labels_list[-1][eos_pos] = input_ids[eos_pos]
+
             if debug == 3 and torch.cuda.current_device() == 0:
                 print(messages)
                 print(input_ids_list)
@@ -277,6 +317,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 "input_ids": input_ids_list,
                 "labels": labels_list,
                 "attention_mask": attention_mask_list,
+                "assistant_start_end": assistant_start_end_list,
             }
         elif linear is not None or random_span_mask:
             return {
@@ -695,6 +736,41 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
     return model, tokenizer
 
 
+class RegularNTPTrainer(Trainer):
+    """Standard NTP (``--regular``), optionally plus the terminator cross-entropy."""
+
+    def __init__(self, *args, eos_ce_weight=0.0, **kwargs):
+        self.eos_ce_weight = float(eos_ce_weight)
+        if not 0.0 <= self.eos_ce_weight < float('inf'):
+            raise ValueError("eos_ce_weight must be finite and non-negative")
+        super().__init__(*args, **kwargs)
+        self._terminal_ids = terminator_ids(self.tokenizer)
+        # The objective uses micro-batch means, not the Trainer's item-count scaling.
+        self.model_accepts_loss_kwargs = False
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        outputs = model(**{key: inputs[key] for key in ("input_ids", "attention_mask", "labels")})
+        loss = outputs.loss
+        if self.eos_ce_weight > 0.0:
+            input_ids, attention_mask, logits = inputs["input_ids"], inputs["attention_mask"], outputs.logits
+            rows, positions = [], []
+            for i, (start, end) in enumerate(inputs["assistant_start_end"].tolist()):
+                pos = end + 1
+                if (end > start and 0 < pos < logits.shape[1]
+                        and attention_mask[i, end] == 1 and attention_mask[i, pos] == 1
+                        and int(input_ids[i, pos]) in self._terminal_ids):
+                    rows.append(i)
+                    positions.append(pos)
+            if rows:
+                eos_ce = F.cross_entropy(logits[rows, [q - 1 for q in positions]].float(),
+                                         input_ids[rows, positions].to(logits.device))
+                loss = loss + self.eos_ce_weight * eos_ce
+                if self.model.training and self.is_world_process_zero() and self.args.logging_steps > 0 \
+                        and self.state.global_step % self.args.logging_steps == 0:
+                    self.log({"eos_ce": eos_ce.item()})
+        return (loss, outputs) if return_outputs else loss
+
+
 class RepresentationTrainer(Trainer):
     """
     Trainer to regularize representations.
@@ -733,8 +809,24 @@ class RepresentationTrainer(Trainer):
         self.tube_tau = kwargs.pop('tube_tau', 1e-4)
         self.control_norm = kwargs.pop('control_norm', 'v_geo')
         self.anchor_eps = kwargs.pop('anchor_eps', 1e-3)
-        self.eos_ce_weight = kwargs.pop('eos_ce_weight', 0.0)
+        self.tube_log_interval = kwargs.pop('tube_log_interval', 50)
+        # Optional stop-decision supervision (control_JEPA only; not part of Eq. 19).
+        self.eos_ce_weight = float(kwargs.pop('eos_ce_weight', 0.0))
+        if not 0.0 <= self.eos_ce_weight < float('inf'):
+            raise ValueError("eos_ce_weight must be finite and non-negative")
+        if self.eos_ce_weight > 0.0 and self.linear != "control_JEPA":
+            raise ValueError("eos_ce_weight is only supported for control_JEPA")
+        # Experimental: evaluate the Lyapunov loss on a random sub-segment per example.
+        self.random_span_lyap = kwargs.pop('random_span_lyap', False)
+        # Experimental: Lyapunov-Reachability loss (reach_JEPA / reach_JEPA_angle).
+        self.reach_alpha = kwargs.pop('reach_alpha', 1.0)
+        self.reach_beta = kwargs.pop('reach_beta', 1.0)
+        self.reach_progress_mode = kwargs.pop('reach_progress_mode', 'schedule_asym')
+        # reach_JEPA_angle is reach_JEPA with the angle-form transverse term by default.
+        self.reach_transverse_norm = kwargs.pop('reach_transverse_norm', None) or (
+            'd_t' if self.linear == "reach_JEPA_angle" else 'L')
         self.lyap_tube = None
+        self.lyap_reach = None
         if self.linear == "control_JEPA":
             self.lyap_tube = LyapunovTubeLoss(
                 gamma=self.tube_gamma,
@@ -743,8 +835,16 @@ class RepresentationTrainer(Trainer):
                 use_softplus=True,
                 anchor_eps=self.anchor_eps,
             )
-        elif self.eos_ce_weight > 0:
-            raise ValueError("eos_ce_weight is only supported with linear=control_JEPA")
+        elif self.linear in ("reach_JEPA", "reach_JEPA_angle"):
+            self.lyap_reach = LyapunovReachabilityLoss(
+                alpha=self.reach_alpha,
+                beta=self.reach_beta,
+                gamma=self.tube_gamma,
+                tau=self.tube_tau,
+                progress_mode=self.reach_progress_mode,
+                transverse_norm=self.reach_transverse_norm,
+                use_softplus=True,
+            )
         if self.avg_encoding:
             assert not self.additive_mask, f"additive_mask cannot be set if avg_encoding is set."
             assert self.linear is None, f"linear cannot be set if avg_encoding is set."
@@ -759,12 +859,7 @@ class RepresentationTrainer(Trainer):
             print(f"On rank {rank}, using seed {self.args.seed + rank * 3} tied to device {self.args.device}")
         self.eos_token_id = self.tokenizer.eos_token_id
         self.mask_token_id = self.tokenizer.mask_token_id
-        # Ids that may terminate an assistant turn (Llama-3 ends turns with <|eot_id|>).
-        self._terminator_ids = {self.tokenizer.eos_token_id}
-        for name in ("<|eot_id|>", "<|end_of_text|>", "<end_of_turn>"):
-            tid = self.tokenizer.convert_tokens_to_ids(name)
-            if tid is not None and tid != self.tokenizer.unk_token_id:
-                self._terminator_ids.add(tid)
+        self._terminator_ids = terminator_ids(self.tokenizer, include_pad=True)
     
     def get_lbd(self):
         if not self.lbd_warmup:
@@ -1166,24 +1261,50 @@ class RepresentationTrainer(Trainer):
             return curvature, length - 1
         return 0.0, 0
 
-    def _lyapunov_bounds(self):
+    def _lyapunov_bounds(self, random_span=False):
         """Inclusive (start, end) token indices of the user and assistant contents.
 
         ``*_start_end[i]`` stores (index before the first content token, last content token).
+        With ``random_span`` (``--random_span_lyap``) a sub-segment is drawn per example with
+        the STP sampler ``get_s_t`` and mapped back onto the two spans; a span that the
+        sub-segment does not reach is collapsed to a single token (no transitions).
         """
-        user_bounds = [(int(s) + 1, int(e)) for s, e in self.user_start_end.tolist()]
-        assistant_bounds = [(int(s) + 1, int(e)) for s, e in self.assistant_start_end.tolist()]
+        user_bounds: List[Tuple[int, int]] = []
+        assistant_bounds: List[Tuple[int, int]] = []
+        for (us, ue), (as_, ae) in zip(self.user_start_end.tolist(), self.assistant_start_end.tolist()):
+            us, as_ = us + 1, as_ + 1
+            u_len, a_len = max(0, ue - us + 1), max(0, ae - as_ + 1)
+            if not random_span or u_len < 1 or a_len < 1:
+                user_bounds.append((us, ue))
+                assistant_bounds.append((as_, ae))
+                continue
+            ps, pe = (int(x) for x in self.get_s_t(u_len + a_len))  # pe is exclusive
+            if not 0 <= ps < pe <= u_len + a_len:
+                user_bounds.append((us, ue))
+                assistant_bounds.append((as_, ae))
+                continue
+            ps_abs = us + ps if ps < u_len else as_ + ps - u_len
+            pe_abs = us + pe - 1 if pe <= u_len else as_ + pe - u_len - 1
+            if pe <= u_len:          # sub-segment inside the user span
+                user_bounds.append((ps_abs, pe_abs))
+                assistant_bounds.append((as_, as_))
+            elif ps >= u_len:        # sub-segment inside the assistant span
+                user_bounds.append((ue, ue))
+                assistant_bounds.append((ps_abs, pe_abs))
+            else:                    # sub-segment straddles the prompt template
+                user_bounds.append((ps_abs, ue))
+                assistant_bounds.append((as_, pe_abs))
         return user_bounds, assistant_bounds
 
     def _terminator_ce(self, logits, input_ids):
         """Cross-entropy of predicting the turn terminator after the last answer token.
 
-        Optional and off by default (``--eos_ce_weight 0``); not part of Eq. (19).
+        Optional (``--eos_ce_weight``, control_JEPA only); not part of Eq. (19).
         """
         rows, cols, targets = [], [], []
         for i, (_, end) in enumerate(self.assistant_start_end.tolist()):
             pos = int(end) + 1
-            if pos < input_ids.shape[1] and int(input_ids[i, pos]) in self._terminator_ids:
+            if 0 < pos < input_ids.shape[1] and int(input_ids[i, pos]) in self._terminator_ids:
                 rows.append(i)
                 cols.append(pos - 1)
                 targets.append(int(input_ids[i, pos]))
@@ -1279,6 +1400,7 @@ class RepresentationTrainer(Trainer):
                     if self.debug == 1 and torch.cuda.current_device() == 0:
                         print("patch start/end and length adjustment")
                         print(random_span_start, random_span_end, full_length, weights[j], self.length_adjustment)
+                geometry_diag = chord_geometry_diagnostics(hidden_states, *self._lyapunov_bounds())
             elif self.linear == "curvature":
                 curvature = torch.zeros((hidden_states.shape[0],)).to(hidden_states.device)
                 for i in range(hidden_states.shape[0]):
@@ -1288,13 +1410,16 @@ class RepresentationTrainer(Trainer):
                         curvature[i] = (user_curvature + assistant_curvature) / (user_count + assistante_count)
                 jepa_loss = torch.mean(curvature)
             elif self.linear == "control_JEPA":
-                user_bounds, assistant_bounds = self._lyapunov_bounds()
-                jepa_loss, tube_diag = self.lyap_tube(
-                    hidden_states, user_bounds, assistant_bounds, return_diagnostics=True
-                )
+                bounds = self._lyapunov_bounds(random_span=self.random_span_lyap)
+                jepa_loss, geometry_diag = self.lyap_tube(hidden_states, *bounds, return_diagnostics=True)
+            elif self.linear in ("reach_JEPA", "reach_JEPA_angle"):
+                # reach_JEPA_angle is always step-wise (no random-span remapping).
+                random_span = self.random_span_lyap and self.linear == "reach_JEPA"
+                bounds = self._lyapunov_bounds(random_span=random_span)
+                jepa_loss, geometry_diag = self.lyap_reach(hidden_states, *bounds, return_diagnostics=True)
             else:
                 assert False, f"Unknown linear mode: {self.linear}."
-            if self.linear in ("curvature", "control_JEPA"):
+            if self.linear in TRAJECTORY_MODES:
                 pass  # jepa_loss is computed directly from the trajectory
             elif self.jepa_mse:
                 if self.linear_predictor:
@@ -1315,7 +1440,7 @@ class RepresentationTrainer(Trainer):
                 print(self.user_start_end[:, 1])
                 print(self.assistant_start_end[:, 0])
                 print(self.assistant_start_end[:, 1])
-                if self.linear not in ("curvature", "control_JEPA"):
+                if self.linear not in TRAJECTORY_MODES:
                     print("shape")
                     print(user_embedding.shape, assistant_embedding.shape)
                     print(cosine_similarity.shape)
@@ -1366,20 +1491,13 @@ class RepresentationTrainer(Trainer):
         total_loss = self.gamma * lm_loss + self.get_lbd() * jepa_loss
 
         eos_ce = None
-        if self.linear == "control_JEPA" and self.eos_ce_weight > 0:
+        if self.eos_ce_weight > 0:
             eos_ce = self._terminator_ce(main_outputs.logits, inputs["input_ids"])
             if eos_ce is not None:
                 total_loss = total_loss + self.eos_ce_weight * eos_ce
 
-        if self.linear == "control_JEPA" and self._should_log_components():
-            payload = {
-                "lm_loss": lm_loss.item(),
-                "lyap_loss": jepa_loss.item(),
-                **{k: v.item() for k, v in tube_diag.items()},
-            }
-            if eos_ce is not None:
-                payload["eos_ce"] = eos_ce.item()
-            self.log(payload)
+        if self.linear in ("random_span",) + LYAPUNOV_MODES:
+            self._log_components(lm_loss, jepa_loss, geometry_diag, eos_ce)
 
         if self.debug == 2 and torch.cuda.current_device() == 0:
             print(lm_loss, self.get_lbd(), jepa_loss)
@@ -1394,17 +1512,31 @@ class RepresentationTrainer(Trainer):
 
         return (total_loss, main_outputs) if return_outputs else total_loss
 
-    def _should_log_components(self):
-        """Log loss components once per `logging_steps` optimizer steps (main process)."""
+    def _log_components(self, lm_loss, jepa_loss, geometry_diag, eos_ce=None):
+        """Log the loss components and trajectory diagnostics (main process only).
+
+        Logged every ``logging_steps`` optimizer steps into the trainer log history;
+        Lyapunov modes also print a one-line summary every ``tube_log_interval`` steps.
+        """
         step = self.state.global_step
-        if not (self.model.training and self.is_world_process_zero()):
-            return False
-        if self.args.logging_steps <= 0 or step == 0 or step % self.args.logging_steps:
-            return False
-        if getattr(self, "_last_logged_step", -1) == step:
-            return False
-        self._last_logged_step = step
-        return True
+        if not (self.model.training and self.is_world_process_zero()) or step == 0:
+            return
+        values = {k: float(v) for k, v in geometry_diag.items()}
+        if "mean_raw_violation" in values:
+            values["raw_viol"] = values.pop("mean_raw_violation")
+        payload = {"lm_loss": lm_loss.item(), "jepa_loss": float(jepa_loss), "lbd_used": float(self.get_lbd()),
+                   **values}
+        if eos_ce is not None:
+            payload["eos_ce"] = eos_ce.item()
+        if (self.linear in LYAPUNOV_MODES and self.tube_log_interval > 0 and step % self.tube_log_interval == 0
+                and getattr(self, "_last_printed_step", -1) != step):
+            self._last_printed_step = step
+            print(f"[{self.linear}] step={step} " + " ".join(f"{k}={v:.4g}" for k, v in payload.items()),
+                  flush=True)
+        if (self.args.logging_steps > 0 and step % self.args.logging_steps == 0
+                and getattr(self, "_last_logged_step", -1) != step):
+            self._last_logged_step = step
+            self.log(payload)
 
 
 class ProfilerFLOPCallback(TrainerCallback):
@@ -1472,7 +1604,8 @@ def main():
     parser.add_argument("--jepa_ratio", type=float, default=-1.0, help="When >0, randomly select this ratio of batches to apply JEPA. This implments Random JEPA-Loss Dropout (LD). If LD = alpha, jepa_ratio = 1 - alpha")
     parser.add_argument("--linear", type=str, default=None,
                         help="Linear mode. Can be 'e2e', 'mean', 'random_span' (STP), 'curvature', "
-                             "'control_JEPA' (ControlJEPA).")
+                             "'control_JEPA' (ControlJEPA), or the experimental 'reach_JEPA' / "
+                             "'reach_JEPA_angle' (Lyapunov-Reachability loss).")
     parser.add_argument("--plain_jepa", action="store_true", help="When set, do not apply chat format when compute JEPA loss.")
     parser.add_argument("--linear_predictor", action="store_true", help="Use a inear predictor when set to true.")
     parser.add_argument("--lbd_warmup", action="store_true", help="Linearly warmup lambda when set to True.")
@@ -1505,15 +1638,52 @@ def main():
                         help="ControlJEPA: normalisation of V_t. 'v_geo' = ||e_t||^2/||v_geo||^2 (paper); "
                              "'d_model' and 'd_t' are the ablations of Sec. 6.2.")
     parser.add_argument("--anchor_eps", type=float, default=1e-3,
-                        help="ControlJEPA: anchor smoothing for --control_norm=d_t only.")
-    parser.add_argument("--eos_ce_weight", type=float, default=0.0,
-                        help="ControlJEPA: optional extra cross-entropy on the turn terminator "
-                             "(<|eot_id|>/EOS) after the answer. 0 disables (default).")
+                        help="ControlJEPA: anchor smoothing for --control_norm=d_t only "
+                             "(0 = legacy hard clamp).")
+    parser.add_argument("--lbd_control", type=float, default=None,
+                        help="ControlJEPA: Lyapunov weight; overrides --lbd when --linear=control_JEPA.")
+    parser.add_argument("--tube_log_interval", type=int, default=50,
+                        help="Lyapunov modes: print diagnostics every N optimizer steps (0 = off).")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="AdamW weight decay.")
+    # Stop-decision supervision (not part of the paper). Only for --regular or
+    # --linear=control_JEPA, and only on the datasets listed in --eos_cure_datasets.
+    parser.add_argument("--supervise_eos", action="store_true",
+                        help="Unmask only the <|eot_id|>/EOS label that ends the assistant turn.")
+    parser.add_argument("--eos_ce_weight", type=float, default=0.0,
+                        help="Extra cross-entropy on the terminator prediction after the last answer "
+                             "token, weighted by this value (regular NTP / control_JEPA). 0 = off.")
+    parser.add_argument("--eos_cure", type=str, default="auto", choices=["auto", "on", "off"],
+                        help="Per-dataset gate for --supervise_eos / --eos_ce_weight: 'auto' keeps them "
+                             "only if the train file's dataset is in --eos_cure_datasets, 'on' forces "
+                             "them, 'off' drops them.")
+    parser.add_argument("--eos_cure_datasets", type=str, default="synth,turk",
+                        help="Comma-separated dataset names for --eos_cure=auto.")
+    # Experimental variants (not part of the paper).
+    parser.add_argument("--random_span_lyap", action="store_true",
+                        help="control_JEPA / reach_JEPA: apply the Lyapunov loss to a random sub-segment "
+                             "per example (STP sampler) instead of the full user+assistant span.")
+    parser.add_argument("--alpha", type=float, default=1.0,
+                        help="reach_JEPA: weight of the transverse term.")
+    parser.add_argument("--beta", type=float, default=1.0,
+                        help="reach_JEPA: weight of the progress term.")
+    parser.add_argument("--lbd_reach", type=float, default=None,
+                        help="reach_JEPA: loss weight; overrides --lbd when --linear=reach_JEPA*.")
+    parser.add_argument("--progress_mode", type=str, default="schedule_asym", choices=list(VALID_PROGRESS_MODES),
+                        help="reach_JEPA: 'schedule_asym' = max(0, tau_t - p_t/L)^2, 'endpoint' = (1 - p_t/L)^2.")
+    parser.add_argument("--reach_transverse_norm", type=str, default=None,
+                        choices=list(VALID_REACH_TRANSVERSE_NORMS),
+                        help="reach_JEPA: transverse denominator, 'L' = ||v_geo||^2 or 'd_t' = ||d_t||^2. "
+                             "Defaults to 'd_t' for reach_JEPA_angle and 'L' otherwise.")
 
 
     args = parser.parse_args()
-    
+
+    # Dedicated loss weights (if given) override --lbd for the Lyapunov modes.
+    if args.linear == "control_JEPA" and args.lbd_control is not None:
+        args.lbd = args.lbd_control
+    if args.linear in ("reach_JEPA", "reach_JEPA_angle") and args.lbd_reach is not None:
+        args.lbd = args.lbd_reach
+
     # Validate arguments
     if not args.train_file and not args.data_file:
         parser.error("Must provide either --train_file or --data_file")
@@ -1550,6 +1720,26 @@ def main():
         # torchrun may expose one GPU per worker (CUDA_VISIBLE_DEVICES remapped) or all of them.
         torch.cuda.set_device(local_rank % torch.cuda.device_count())
         torch.distributed.init_process_group(backend='nccl')
+
+    if args.regular and (args.linear is not None or args.additive_mask or args.random_span_mask):
+        parser.error("--regular cannot be combined with representation modes")
+    if not 0.0 <= args.eos_ce_weight < float('inf'):
+        parser.error("--eos_ce_weight must be finite and non-negative")
+    eos_cure_requested = args.supervise_eos or args.eos_ce_weight > 0.0
+    if eos_cure_requested and not (args.regular or args.linear == "control_JEPA"):
+        parser.error("--supervise_eos / --eos_ce_weight require --regular or --linear=control_JEPA")
+    # The stop-decision supervision helps datasets whose answers end in a repeatable atom
+    # (NL-RX-SYNTH / TURK) but hurts short-answer datasets, so it is gated per dataset.
+    if eos_cure_requested and args.eos_cure != "on":
+        dataset_name = re.sub(r"(_(train|test|val))?\.jsonl$", "",
+                              os.path.basename(args.train_file or args.data_file))
+        cure_datasets = {d.strip() for d in args.eos_cure_datasets.split(",") if d.strip()}
+        if not (args.eos_cure == "auto" and dataset_name in cure_datasets):
+            if torch.cuda.current_device() == 0:
+                print(f"[eos_cure] disabled for dataset {dataset_name!r} (--eos_cure={args.eos_cure}, "
+                      f"datasets={sorted(cure_datasets)}): dropping --supervise_eos / --eos_ce_weight.")
+            args.supervise_eos = False
+            args.eos_ce_weight = 0.0
     
     # Setup model and tokenizer
     if torch.cuda.current_device() == 0:
@@ -1574,7 +1764,8 @@ def main():
             front_pred=args.front_pred, reverse_pred=args.reverse_pred,
             linear=args.linear, plain_jepa=args.plain_jepa, random_span_mask=args.random_span_mask,
             same_predictor=args.same_predictor,
-            unmask_assistant_special_tokens=args.unmask_assistant_special_tokens
+            unmask_assistant_special_tokens=args.unmask_assistant_special_tokens,
+            supervise_eos=args.supervise_eos
         )
         
         if args.eval_file:
@@ -1587,7 +1778,8 @@ def main():
                 front_pred=args.front_pred, reverse_pred=args.reverse_pred,
                 linear=args.linear, plain_jepa=args.plain_jepa, random_span_mask=args.random_span_mask,
                 same_predictor=args.same_predictor,
-                unmask_assistant_special_tokens=args.unmask_assistant_special_tokens
+                unmask_assistant_special_tokens=args.unmask_assistant_special_tokens,
+                supervise_eos=args.supervise_eos
             )
         else:
             eval_dataset = None
@@ -1605,7 +1797,8 @@ def main():
             front_pred=args.front_pred, reverse_pred=args.reverse_pred,
             linear=args.linear, plain_jepa=args.plain_jepa, random_span_mask=args.random_span_mask,
             same_predictor=args.same_predictor,
-            unmask_assistant_special_tokens=args.unmask_assistant_special_tokens
+            unmask_assistant_special_tokens=args.unmask_assistant_special_tokens,
+            supervise_eos=args.supervise_eos
         )
 
         if args.eval_split > 0:
@@ -1628,8 +1821,10 @@ def main():
         else:
             print("No evaluation dataset")
     
-    # Data collator - don't use padding since we already padded
-    if args.use_default_data_collator:
+    # Data collator - don't use padding since we already padded.
+    # DataCollatorForLanguageModeling rebuilds labels from input_ids, which would discard the
+    # --supervise_eos label edit for regular NTP; keep the dataset labels in that case.
+    if args.use_default_data_collator or (args.regular and eos_cure_requested):
         data_collator = default_data_collator
     else:
         data_collator = DataCollatorForLanguageModeling(
@@ -1654,9 +1849,17 @@ def main():
         if torch.cuda.current_device() == 0:
             print(f">>>>> --same_flop is active: Save checkpoint every: {save_steps} steps, run {args.num_epochs} epochs")
     output_dir = os.path.abspath(args.output_dir)
-    if torch.cuda.current_device() == 0:
+    if args.regular:
+        # Never wipe an existing regular-NTP run (these are reused as baselines).
+        if os.path.isdir(output_dir) and os.listdir(output_dir):
+            raise FileExistsError(f"refusing to overwrite existing output_dir {output_dir}")
+        if torch.cuda.current_device() == 0:
+            os.makedirs(output_dir, exist_ok=True)
+    elif torch.cuda.current_device() == 0:
         shutil.rmtree(output_dir, ignore_errors=True)
         os.makedirs(output_dir, exist_ok=True)
+    if world_size > 1:
+        torch.distributed.barrier()
     training_args = TrainingArguments(
         output_dir=output_dir,
         overwrite_output_dir=True,
@@ -1719,7 +1922,7 @@ def main():
     if args.regular:
         if torch.cuda.current_device() == 0:
             print("\n3. Initializing regular trainer...")
-        trainer = Trainer(
+        trainer = RegularNTPTrainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
@@ -1727,6 +1930,7 @@ def main():
             tokenizer=tokenizer,
             data_collator=data_collator,
             callbacks=[flop_callback] if args.track_flop else [],
+            eos_ce_weight=args.eos_ce_weight,
         )
     else:
         if torch.cuda.current_device() == 0:
@@ -1769,7 +1973,13 @@ def main():
             tube_tau=args.tube_tau,
             control_norm=args.control_norm,
             anchor_eps=args.anchor_eps,
+            tube_log_interval=args.tube_log_interval,
             eos_ce_weight=args.eos_ce_weight,
+            random_span_lyap=args.random_span_lyap,
+            reach_alpha=args.alpha,
+            reach_beta=args.beta,
+            reach_progress_mode=args.progress_mode,
+            reach_transverse_norm=args.reach_transverse_norm,
         )
     
     if torch.cuda.current_device() == 0 and args.lora:

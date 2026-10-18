@@ -102,6 +102,31 @@ def chord_decomposition(
     return {"d": d, "e": e, "v_geo": v_geo, "valid": valid}
 
 
+@torch.no_grad()
+def chord_geometry_diagnostics(
+    h: torch.Tensor,
+    user_bounds: Bounds,
+    assistant_bounds: Bounds,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """``||e_t||`` (mean over valid transitions) and ``||v_geo||`` (mean over the batch).
+
+    Used to log the same trajectory geometry for every method (e.g. STP).
+    """
+    geom = chord_decomposition(h, user_bounds, assistant_bounds, eps=eps)
+    mask = geom["valid"].to(h.dtype)
+    n = geom["valid"].sum().clamp(min=1).to(h.dtype)
+    e_sq = geom["e"].pow(2).sum(dim=-1)[:, :-1]
+    v_sq = geom["v_geo"].pow(2).sum(dim=-1)
+    return {
+        "mean_e_sq": (e_sq * mask).sum() / n,
+        "mean_e_norm": (e_sq.sqrt() * mask).sum() / n,
+        "mean_v_geo_sq": v_sq.mean(),
+        "mean_v_geo_norm": v_sq.sqrt().mean(),
+        "num_valid": geom["valid"].sum(),
+    }
+
+
 class LyapunovTubeLoss(nn.Module):
     """Lyapunov Tube Loss, Eq. (18) of the paper.
 
@@ -183,14 +208,16 @@ class LyapunovTubeLoss(nn.Module):
             return loss
 
         with torch.no_grad():
-            e_norm = geom["e"].norm(dim=-1)[:, :-1]
-            v_norm = geom["v_geo"].norm(dim=-1)
+            e_sq = geom["e"].pow(2).sum(dim=-1)[:, :-1]
+            v_sq = geom["v_geo"].pow(2).sum(dim=-1)
             diag = {
                 "mean_V": (V[:, 1:] * mask).sum() / n,
                 "viol_rate": ((violation > 0).to(h.dtype) * mask).sum() / n,
-                "mean_violation": (violation * mask).sum() / n,
-                "mean_e_norm": (e_norm * mask).sum() / n,
-                "mean_v_geo_norm": v_norm.mean(),
+                "mean_raw_violation": (violation * mask).sum() / n,
+                "mean_e_sq": (e_sq * mask).sum() / n,
+                "mean_e_norm": (e_sq.sqrt() * mask).sum() / n,
+                "mean_v_geo_sq": v_sq.mean(),
+                "mean_v_geo_norm": v_sq.sqrt().mean(),
                 "num_valid": num_valid,
             }
         return loss, diag

@@ -45,6 +45,11 @@ evaluate() {
 # train <method> <base_model> <dataset_prefix> <seed> <output_dir> [extra args...]
 #   (set TRAIN_FILE to override <dataset_prefix>_train.jsonl)
 #   method in {regular, llm_jepa, stp, controljepa}
+#   experimental (not in the paper): {reach_jepa, reach_jepa_angle, reach_jepa_rs}
+#
+# controljepa also passes the stop-decision supervision (--supervise_eos --eos_ce_weight).
+# stp.py keeps it only for the datasets in --eos_cure_datasets (synth, turk) and drops it
+# elsewhere; set EOS_CURE=off to disable it everywhere or EOS_CURE=on to force it.
 train() {
   local method=$1 model=$2 dataset=$3 seed=$4 out=$5; shift 5
   local common=(--train_file="${TRAIN_FILE:-${dataset}_train.jsonl}" --output_dir="${out}" --model_name="${model}"
@@ -63,7 +68,16 @@ train() {
     controljepa)
       launch stp.py "${common[@]}" --linear=control_JEPA --last_token="${lt}" \
         --lbd="${LAMBDA:-0.05}" --tube_gamma="${GAMMA:-0.95}" --tube_tau="${TAU:-1e-4}" \
-        --control_norm="${CONTROL_NORM:-v_geo}" --predictors=0 "$@" ;;
+        --control_norm="${CONTROL_NORM:-v_geo}" --predictors=0 \
+        --supervise_eos --eos_ce_weight="${EOS_CE_WEIGHT:-2}" --eos_cure="${EOS_CURE:-auto}" "$@" ;;
+    reach_jepa|reach_jepa_angle|reach_jepa_rs)
+      local mode=reach_JEPA rs=()
+      [[ "${method}" == reach_jepa_angle ]] && mode=reach_JEPA_angle
+      [[ "${method}" == reach_jepa_rs ]] && rs=(--random_span_lyap)
+      launch stp.py "${common[@]}" --linear="${mode}" --last_token="${lt}" \
+        --lbd_reach="${LAMBDA_REACH:-0.05}" --alpha="${REACH_ALPHA:-1.0}" --beta="${REACH_BETA:-1.0}" \
+        --progress_mode="${PROGRESS_MODE:-schedule_asym}" --tube_gamma="${GAMMA:-0.95}" \
+        --tube_tau="${TAU:-1e-4}" --predictors=0 "${rs[@]}" "$@" ;;
     *)
       echo "unknown method: ${method}" >&2; return 1 ;;
   esac
