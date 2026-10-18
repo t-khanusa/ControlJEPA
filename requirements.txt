@@ -1,0 +1,16 @@
+# Tested with Python 3.10, CUDA 12.6.
+# Install PyTorch first for your CUDA version, e.g.
+#   pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+torch>=2.6
+transformers>=4.53,<4.56
+peft>=0.17
+datasets>=3.0
+accelerate>=1.0
+safetensors
+numpy
+scikit-learn
+matplotlib
+tqdm
+sentencepiece
+protobuf
+pytest

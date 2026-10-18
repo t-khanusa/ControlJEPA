@@ -1,91 +1,341 @@
-# Project
+<div align="center">
 
-## Set Up
+# ControlJEPA: Principled Trajectory Regularization via Lyapunov Tube Loss
 
-See `setup.sh`.
+**Thai-Khanh Nguyen**<sup>1\*</sup> &nbsp;
+**Nhi Y. Pham**<sup>2\*</sup> &nbsp;
+**Uyen N.B. Vo**<sup>1\*</sup> &nbsp;
+**Thieu N. Vo**<sup>3†</sup> &nbsp;
+**Cuong Pham**<sup>1†</sup> &nbsp;
+**Tan M. Nguyen**<sup>4†</sup>
 
-**NOTE**: Do NOT run `setup.sh` directly. Read the file, choose the configuration for your envirnoment, and execute the relevant commands manually.
+<sup>1</sup>Posts & Telecommunications Institute of Technology &nbsp;
+<sup>2</sup>VinUniversity &nbsp;
+<sup>3</sup>University of Bath &nbsp;
+<sup>4</sup>National University of Singapore
 
-<a id="stp"></a>
-## Semantic Tube Prediction
+<sup>\*</sup>Equal contribution &nbsp; <sup>†</sup>Equal advising
 
-The fine-tuning script is in `stp.py`. A convenient driver script, `run_stp.sh`, provides `run_regular()` for standard fine-tuning, and `run_stp_jepa()` for Semantic Tupe Prediction fine-tuning.
+**NeurIPS 2026**
 
-General flags:
+[![Conference](https://img.shields.io/badge/NeurIPS-2026-4b44ce.svg)](https://neurips.cc/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-3776ab.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.6%2B-ee4c2c.svg)](https://pytorch.org/)
 
-*   `--linear=random_span` for Semantic Tube Prediction.
-*   `--linear_predictor` for training a linear predictor.
+</div>
 
-Ablation study flags:
+<p align="center">
+  <img src="assets/lyapunov_tube.png" width="88%" alt="The Lyapunov tube around the reference secant">
+</p>
 
-*   `--linear=e2e` for Two View in ablation study.
-*   `--random_span_mask` and `--random_span_mask_recover` for Mask in ablation study.
-*   `--linear=curvature` for Curvature in ablation study.
+<p align="center"><em>
+The displacement d<sub>t</sub> = h<sub>t</sub> − h<sub>t<sub>start</sub></sub> splits into a component along the
+reference secant v<sub>geo</sub> and a transversal error e<sub>t</sub> ⊥ v<sub>geo</sub>. The Lyapunov Tube
+Loss penalises violations of V<sub>t+1</sub> ≤ γV<sub>t</sub> + τ, which keeps hidden-state trajectories inside the tube.
+</em></p>
 
-Other flags are documented in `stp.py`.
+## TL;DR
 
-`run_stp_jepa()` will ignore `predictors`.
+Next-token prediction places almost no constraint on the path that hidden states take through a sequence. Earlier
+geometric regularisers mostly control the *direction* of that path, not *how far* it strays. **ControlJEPA** adds a
+single training loss, the **Lyapunov Tube Loss**, built on the discrete-time contraction condition from practical
+Input-to-State Stability (ISS). The loss is applied to a scale-invariant measure of transversal deviation.
 
-## Fine-tuning
+- **Tube guarantee.** When the contraction condition holds at every step, the trajectory stays inside an explicit tube
+  around the reference secant.
+- **Partial-ISS bounds.** When it holds only partly, the paper bounds the mean transversal energy, the temporal
+  variance and the average tube width in terms of the loss value and (γ, τ).
+- **No architecture changes and no inference cost.** The regulariser is used only during fine-tuning. The smoother
+  transversal profile still holds at generation time, when the loss is switched off.
+- **Results.** Across 6 benchmarks and 6 model families, ControlJEPA improves accuracy and data efficiency over
+  standard fine-tuning, [LLM-JEPA](https://github.com/galilai-group/llm-jepa) and Semantic Tube Prediction (STP).
 
-The fine-tuning script is in `finetune.py`. A convenient driver script, `run.sh`, provides `run_regular()` for standard fine-tuning, and `run_jepa()` for JEPA-style fine-tuning.
+## Method
 
-For all experiments, we fix number of epochs to 4. The `last_token` setting depends on the model family; see the commented lines in `run.sh` for how to set it. Each configuration is run with 5 random seeds. We report mean accuracy and standard deviation.
+For a training example (the user turn followed by the assistant turn), let `h_t` be the final-layer hidden state at
+token `t`. ControlJEPA decomposes the trajectory with respect to its reference secant, as in Eqs. (9)–(11):
 
-The original implementation required two additional forward passes to encode `Text` and `Code` separately. The latest version combines them into a single forward pass using a 4D additive attention mask. Enable this feature with `--additive_mask`. **NOTE**: `--additive_mask` may not work if the tokenizer applies left-padding.
+$$
+v_{\text{geo}} = h_{t_{\text{end}}} - h_{t_{\text{start}}},\qquad
+d_t = h_t - h_{t_{\text{start}}},\qquad
+e_t = \big(I - \hat v \hat v^{\top}\big)\, d_t,\qquad
+V_t = \frac{\lVert e_t\rVert_2^2}{\lVert v_{\text{geo}}\rVert_2^2}.
+$$
 
-## Large models
+The Lyapunov candidate $V_t$ is dimensionless and is zero at both anchors. Practical ISS requires
+$V_{t+1} \le \gamma V_t + \tau$ (Eq. 12). This gives $V_t \le \tau/(1-\gamma)$, i.e. a tube of radius
+$r^\star = \sqrt{\tau/(1-\gamma)}\,\lVert v_{\text{geo}}\rVert_2$ (Eq. 16). The loss penalises violations of the
+condition (Eqs. 17–19):
 
-Similarly, we provide `finetune8bh200.py` and `run8bh200.sh` for training modesl up to 8B parameters on NVIDIA H200 GPUs.
+$$
+\mathcal{L}_{\text{Lyap}} = \frac{1}{|\mathcal{T}|}\sum_{t\in\mathcal{T}} \sigma\!\big(V_{t+1} - \gamma V_t - \tau\big),
+\qquad
+\mathcal{L} = \mathcal{L}_{\text{NTP}} + \lambda\,\mathcal{L}_{\text{Lyap}},
+\qquad \sigma\in\{\text{softplus}, \text{ReLU}\}.
+$$
 
-## LoRA
+### From equations to code
 
-Use `--lora` and `--lora_rank <N>` to enable LoRA fine-tuning.
+| Paper | Code |
+| --- | --- |
+| Secant, displacement and transversal error, Eqs. (9)–(10) | [`lyapunov_loss.chord_decomposition`](lyapunov_loss.py) |
+| Dimensionless Lyapunov candidate $V_t$, Eq. (11) | [`LyapunovTubeLoss.lyapunov_candidate`](lyapunov_loss.py) |
+| Violation penalty and Lyapunov Tube Loss, Eqs. (17)–(18) | [`LyapunovTubeLoss.forward`](lyapunov_loss.py) |
+| Training objective $\mathcal{L}_{\text{NTP}} + \lambda\mathcal{L}_{\text{Lyap}}$, Eq. (19) | `RepresentationTrainer.compute_loss` in [`stp.py`](stp.py) |
+| Ablations $\lVert e_t\rVert^2/D$ and $\lVert e_t\rVert^2/\lVert d_t\rVert^2$, Sec. 6.2 | `--control_norm d_model` / `--control_norm d_t` |
 
-## Pretraining
+**Implementation note: the chord.** In a chat-formatted example, the user content and the assistant content are
+separated by prompt-template tokens (for example `<|eot_id|><|start_header_id|>assistant<|end_header_id|>`). The
+trajectory is the user span `[u_s, u_e]` followed by the assistant span `[a_s, a_e]`, and the template tokens are
+skipped:
 
-Use `--pretrain` to start from randomly initialized weights.
+```text
+v_user = h[u_e] - h[u_s]
+v_geo  = v_user + (h[a_e] - h[a_s])
+d_t    = h[t] - h[u_s]                for t in [u_s, u_e]
+d_t    = v_user + (h[t] - h[a_s])     for t in [a_s, a_e]
+```
 
-For pretraining on the `paraphrase` dataset, pass `--plain --trainall` to disable the OpenAI message format, train next-token prediction, and jointly minimize distances between paraphrase variants.
+The set of transitions $\mathcal{T}$ contains only the transitions *inside* each span. The jump across the template is
+never penalised.
 
-After pretaining, fine-tune with `--plain` on `rotten_tomatoes` and `yelp`. For evaluation, run with `--plain --statswith` to bypass the OpenAI message format and score only the first token(the model isn't instruction-tuned, so it may not emit a clean stop).
+```python
+from lyapunov_loss import LyapunovTubeLoss
 
-## Ablation of JEPA-loss
+loss_fn = LyapunovTubeLoss(gamma=0.95, tau=1e-4)                # softplus penalty, V_t = ||e_t||^2 / ||v_geo||^2
+lyap = loss_fn(hidden_states, user_bounds, assistant_bounds)   # (B, T, D); inclusive (start, end) per example
+loss = lm_loss + 0.05 * lyap
+```
 
-We provide several options for ablating JEPA-loss in `finetune.py`:
+## Results
 
-*  L2 norm: pass `--jepa_l2`
-*  Mean squred error: pass `--jepa_mse`
-*  Prepend `[PRED]` token to `Text`: pass `--front_pred`
-*  Let `Code` predict `Text`: pass `--reverse_pred`
-*  Use InfoNCE loss, pass `--infonce`
+<p align="center">
+  <img src="assets/main_results.png" width="100%" alt="Accuracy of NTP, LLM-JEPA, STP and ControlJEPA">
+</p>
 
-## FLOPs
+<p align="center"><em>
+Accuracy (mean ± std over 5 seeds) of NTP, LLM-JEPA, STP and ControlJEPA across (a) benchmarks,
+(b) model families and (c) model sizes (Fig. 3 of the paper).
+</em></p>
 
-To track FLOPs per step, pass `--track_flop` to `finetune.py`. This prints the FLOPs for the first 10 steps. The total FLOPs can be estimated as `PER_STEP_FLOPS * NUMBER_OF_STEPS`. When `--jepa_ratio` is enabled (see [Random JEPA-loss Dropout](#random-jepa-loss-dropout) below), FLOPs may vary across steps; in this case, use the _average_ FLOPs per step instead.
+ControlJEPA gains the most on GSM8K and NQ-Open, about +10 points over NTP. The paper also reports:
 
-For fair comparisons, we provide `--same_flop`, which computes the number of training steps required to match the total FLOPs of standard fine-tuning, taking into account `--additive_mask` and/or `--jepa_ratio`. Checkpoints are saved at those steps and can be used for evaluatioin. 
+- the Lyapunov loss is stable for λ ∈ [0.01, 0.08];
+- ControlJEPA matches full-data NTP using only a fraction of the training data;
+- it has a higher median signal-to-noise ratio (Eq. 30) than NTP and STP on open-loop generations.
 
-*  If `--additive_mask` is enabled, the same number of steps requires `2X` the compute.
-*  If `--jepa_ratio` is set to `1 - alpha`, the same number of steps use `(2 - alpha)X` the compute.
+The ablations show that both design choices matter:
 
-## Random JEPA-loss Dropout
+- **Normalisation of V<sub>t</sub>.** Removing it causes scale collapse, and accuracy drops to 6.3%.
+- **Contraction rate.** A strict γ = 0.8 gives 28.7%, compared with 86.78% at γ = 0.95.
 
-The fine-tuning script `finetune.py` supports `--jepa_ratio` to implement **random JEPA-loss dropout**. The idea is that randomly dorpping some JEPA-loss has little impact on performance, but can substaintially reduce compute cost.
+## Repository structure
 
-When dropout is active, the extra forward pass for `Enc(Text)` and `Enc(Code)` is skipped. If the dropout rate `LD = alpha`, then correspondingly `--jepa_ratio` should be set to `1 - alpha`. On average, one training step costs `(2 - alpha)X` the compute of standard fine-tuning.
+```text
+ControlJEPA/
+├── lyapunov_loss.py     # Lyapunov Tube Loss (self-contained, depends only on PyTorch)
+├── stp.py               # Training: NTP (--regular), STP (--linear=random_span), ControlJEPA (--linear=control_JEPA)
+├── finetune.py          # LLM-JEPA baseline (unchanged from the official implementation)
+├── evaluate.py          # Generation-based evaluation, shared by all methods
+├── scripts/
+│   ├── common.sh        # Per-model / per-benchmark settings, train() and evaluate() helpers
+│   ├── run.sh           # Main results: methods x models x benchmarks x 5 seeds
+│   └── sweep.sh         # (lambda, gamma, tau) sweep, normalisation ablation, data efficiency
+├── datasets/            # Train/test splits in OpenAI-message JSONL format
+├── tests/               # Unit tests for the loss and the evaluation metrics
+└── assets/              # Figures for this README
+```
 
-Empirical results show that the JEPA auxiliary objective can tolerate aggressive dropout rate (e.g., `LD = 0.75`), requiring `1.25X` the compute while maintaining fine-tuning performance.
+## Installation
 
-## Datasets
+```bash
+git clone https://github.com/t-khanusa/ControlJEPA.git
+cd ControlJEPA
+conda create -n controljepa python=3.10 -y
+conda activate controljepa
+pip install torch --index-url https://download.pytorch.org/whl/cu126   # pick the build for your CUDA version
+pip install -r requirements.txt
+```
 
-Most datasets include `_train.jsonl` and `_test.jsonl` files for fine-tuning and evaluation, repsectively. The originals come from prior publications; we preprocessed them and include the results here for convenience.
+The Llama and Gemma checkpoints are gated on the Hugging Face Hub. Accept their licences, then run
+`huggingface-cli login`.
 
-*  `synth` and `turk`, from https://arxiv.org/abs/1608.03000
-*  `gsm8k`, from https://arxiv.org/abs/2110.14168
-*  `spider`, from https://arxiv.org/abs/1809.08887. You aslo need to unzip `spider_data.zip` which contains `sqlite` databases to execute and evaluate the generated queries.
-*  `paraphrase`, from HuggingFace `cestwc/paraphrase` dataset. Only have `train` split, for pre-training only.
-*  `rotten_tomatoes`, from HuggingFace `cornell-movie-review-data/rotten_tomatoes` dataset. Used for fine-tuning and evaluating models pretrained by `paraphrase` dataset.
-*  `yelp`, from HuggingFace `Yelp/yelp_review_full` dataset. Used for fine-tuning and evaluating models pretrained by `paraphrase` dataset.
-*  `nq_open`, from https://arxiv.org/abs/1906.00300.
-*  `hellaswag`, from HuggingFace `hellaswag` dataset.
+### Data
+
+The NL-RX-SYNTH, NL-RX-TURK, GSM8K, Spider, NQ-Open and HellaSwag splits are in [`datasets/`](datasets), in the same
+format as LLM-JEPA and STP. `datasets/synth_train_frac1_{2,4,8,16,32}.jsonl` are the subsampled training sets used for
+the data-efficiency study (Sec. 5.3).
+
+Spider is evaluated by *execution accuracy*, which needs the Spider SQLite databases. Download them from the
+[official Spider page](https://yale-lily.github.io/spider), or take `spider_data.zip` from the
+[LLM-JEPA repository](https://github.com/galilai-group/llm-jepa). Unzip so that this file exists:
+
+```text
+spider_data/database/<db_id>/<db_id>.sqlite
+```
+
+## Quick start
+
+To train ControlJEPA on NL-RX-SYNTH with Llama-3.2-1B-Instruct on 2 GPUs and then evaluate it:
+
+```bash
+torchrun --nproc_per_node=2 stp.py \
+  --train_file=datasets/synth_train.jsonl --output_dir=checkpoints/controljepa-synth \
+  --model_name=meta-llama/Llama-3.2-1B-Instruct --finetune_seed=82 \
+  --num_epochs=4 --learning_rate=2e-5 --batch_size=2 --grad_accum=4 \
+  --linear=control_JEPA --last_token=-2 --predictors=0 \
+  --lbd=0.05 --tube_gamma=0.95 --tube_tau=1e-4
+
+python evaluate.py \
+  --model_name=checkpoints/controljepa-synth --original_model_name=meta-llama/Llama-3.2-1B-Instruct \
+  --input_file=datasets/synth_test.jsonl --output_file=checkpoints/controljepa-synth/eval.jsonl \
+  --split_tune_untune --nosplit_data --max_new_tokens=96
+```
+
+The ControlJEPA-specific flags are:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--linear=control_JEPA` | | Turn on the Lyapunov Tube Loss |
+| `--lbd` | `0.1` (scripts use `0.05`) | Loss weight λ |
+| `--tube_gamma` | `0.95` | Contraction rate γ ∈ (0, 1) |
+| `--tube_tau` | `1e-4` | ISS slack τ ≥ 0 |
+| `--control_norm` | `v_geo` | Normalisation of $V_t$: `v_geo` (the method), or the `d_model` / `d_t` ablations |
+| `--anchor_eps` | `1e-3` | Smoothing of the `d_t` denominator near the anchors (used only by the ablation) |
+| `--random_span_layer` | `-1` | Decoder layer whose hidden states form the trajectory |
+
+## Reproducing the paper
+
+All methods share one codebase, the same splits, the same decoding and the same validation rules. Each configuration is
+run with the 5 seeds `82 23 37 84 4`. The scripts default to 2 GPUs (`NPROC_PER_NODE=2`).
+
+**Main results (Fig. 3).** These are NTP, LLM-JEPA, STP and ControlJEPA across datasets, model families and model
+sizes:
+
+```bash
+# All benchmarks, Llama-3.2-1B-Instruct, 5 seeds, all four methods
+METHODS="regular llm_jepa stp controljepa" bash scripts/run.sh
+
+# Model families and sizes
+MODELS="google/gemma-2-2b-it apple/OpenELM-1_1B-Instruct allenai/OLMo-2-0425-1B-Instruct \
+        Qwen/Qwen3-1.7B deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" DATASETS=synth bash scripts/run.sh
+MODELS="meta-llama/Llama-3.2-3B-Instruct meta-llama/Llama-3.1-8B-Instruct" DATASETS=synth bash scripts/run.sh
+```
+
+Each run writes `eval_result.txt` to its checkpoint directory and appends its accuracy to `results.txt`. A run whose
+`eval_result.txt` already holds a result is skipped, so an interrupted sweep can be restarted. Every hyperparameter in
+[`scripts/common.sh`](scripts/common.sh) can be overridden with an environment variable (`EPOCHS`, `LR`, `LAMBDA`,
+`GAMMA`, `TAU`, `STP_LBD`, `LLM_JEPA_LBD`, ...). In the paper, the baselines use their *published, dataset-tuned*
+epochs, learning rates and loss weights. Set these through the same variables, e.g.
+`EPOCHS=... LR=... LLM_JEPA_LBD=... METHODS=llm_jepa bash scripts/run.sh`.
+
+**Sensitivity and ablations (Secs. 5.3–6.3, App. B.2):**
+
+```bash
+bash scripts/sweep.sh                    # lambda x gamma x tau grid (Fig. 4b, Fig. 7)
+SWEEP=norm bash scripts/sweep.sh         # V_t normalisation (Fig. 5b) and strict contraction gamma = 0.8 (Fig. 2b)
+SWEEP=data bash scripts/sweep.sh         # data efficiency on subsampled NL-RX-SYNTH (Fig. 4a)
+```
+
+### Hyperparameters
+
+ControlJEPA reuses the shared fine-tuning settings and tunes only its three stability parameters.
+
+| | Value |
+| --- | --- |
+| Optimiser / learning rate / epochs | AdamW, `2e-5`, 4 |
+| Per-device batch × grad. accumulation × GPUs | 2 × 4 × 2 |
+| λ (`--lbd`) | `0.05`; accuracy is stable for λ ∈ [0.01, 0.08] |
+| γ (`--tube_gamma`) | `0.95`; rule-based tasks (SYNTH) peak at γ ∈ [0.84, 0.9] with small τ, open-domain tasks (NQ-Open, HellaSwag) at γ ∈ [0.9, 0.95] with larger τ |
+| τ (`--tube_tau`) | `1e-4` |
+
+Model-dependent settings, as in LLM-JEPA and STP:
+
+| Model family | `--last_token` |
+| --- | --- |
+| Llama-3, Gemma-2 | `-2` |
+| OpenELM | `-4` |
+| Qwen3 | `-3` |
+| OLMo-2, DeepSeek-R1-Distill | `-1` |
+
+The generation budget (`--max_new_tokens`) is 96 for SYNTH and TURK, 256 for GSM8K, 128 for Spider, 64 for NQ-Open and
+8 for HellaSwag.
+
+### Training diagnostics
+
+When `--linear=control_JEPA` is set, the trainer logs the following every `--eval_steps` optimiser steps (this is the
+logging interval, default 10):
+
+| Key | Meaning |
+| --- | --- |
+| `lm_loss`, `lyap_loss` | $\mathcal{L}_{\text{NTP}}$ and $\mathcal{L}_{\text{Lyap}}$ |
+| `mean_V` | Mean Lyapunov candidate $V_{t+1}$ over $\mathcal{T}$ |
+| `viol_rate`, `mean_violation` | Fraction of transitions with $V_{t+1} > \gamma V_t + \tau$, and the mean signed innovation |
+| `mean_e_norm`, `mean_v_geo_norm` | $\lVert e_t\rVert_2$ and $\lVert v_{\text{geo}}\rVert_2$ (Fig. 2b) |
+
+With the softplus penalty, `lyap_loss` settles near $\ln 2 \approx 0.69$. This is the value of $\sigma(0)$ and is
+expected: training runs in the partial-ISS regime (Sec. 4.2), where $\lVert e_t\rVert$ stays strictly positive and the
+representational capacity is kept. If `mean_v_geo_norm` collapses towards 0, the normalisation is set wrong
+(`--control_norm d_model`). If `mean_e_norm` is driven to 0, γ is too strict (Sec. 6.3).
+
+## Evaluation protocol
+
+[`evaluate.py`](evaluate.py) generates greedily (temperature 0, repetition penalty 1.1) and scores each benchmark as
+follows:
+
+| Benchmark | Metric |
+| --- | --- |
+| NL-RX-SYNTH, NL-RX-TURK | Exact match of the regular expression |
+| GSM8K | Exact match of the normalised final answer after `####` |
+| Spider | Execution accuracy against the gold query on the Spider databases |
+| NQ-Open | Normalised containment of any reference answer |
+| HellaSwag | First option letter (A–D) in the generation |
+
+The benchmark is inferred from the *basename* of `--input_file`, so `datasets/gsm8k_test.jsonl` and `gsm8k_test.jsonl`
+are scored the same way. All four methods use this evaluator.
+
+<details>
+<summary><b>Optional: terminator supervision (<code>--eos_ce_weight</code>)</b></summary>
+
+`--eos_ce_weight w` (default `0`, ControlJEPA only) adds `w · CE(<|eot_id|>)` at the position right after the last
+assistant token. It is **not** part of Eq. (19) and is off unless you ask for it. It is provided because, on NL-RX-TURK,
+fine-tuned models sometimes fail to emit the turn terminator and keep generating past the answer, which exact-match
+scoring counts as wrong. If you enable it, report it.
+</details>
+
+## Tests
+
+```bash
+pytest tests/
+```
+
+The tests check `LyapunovTubeLoss` against a per-token transcription of Eqs. (9)–(11) and (17)–(18). They also check
+scale invariance, $V=0$ at the anchors, that the prompt-template gap is not penalised, the ln 2 floor of the softplus
+penalty, and the answer normalisation used by the evaluator.
+
+## Acknowledgements
+
+This code builds on [LLM-JEPA](https://github.com/galilai-group/llm-jepa) and Semantic Tube Prediction. `finetune.py`,
+the data format and the training pipeline in `stp.py` come from their official implementation. We thank the authors
+for releasing their code.
+
+## Citation
+
+```bibtex
+@inproceedings{nguyen2026controljepa,
+  title     = {{ControlJEPA}: Principled Trajectory Regularization via {L}yapunov Tube Loss},
+  author    = {Nguyen, Thai-Khanh and Pham, Nhi Y. and Vo, Uyen N.B. and Vo, Thieu N. and Pham, Cuong and Nguyen, Tan M.},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2026}
+}
+```
+
+## Contact
+
+Questions and issues: please open a GitHub issue, or email Thai-Khanh Nguyen (khanhnt1@ptit.edu.vn) or Tan M. Nguyen
+(tanmn@nus.edu.sg).
+
+## License
+
+Released under the [Apache 2.0 License](LICENSE).
