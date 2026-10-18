@@ -2,20 +2,6 @@
 
 # ControlJEPA: Principled Trajectory Regularization via Lyapunov Tube Loss
 
-**Thai-Khanh Nguyen**<sup>1\*</sup> &nbsp;
-**Nhi Y. Pham**<sup>2\*</sup> &nbsp;
-**Uyen N.B. Vo**<sup>1\*</sup> &nbsp;
-**Thieu N. Vo**<sup>3†</sup> &nbsp;
-**Cuong Pham**<sup>1†</sup> &nbsp;
-**Tan M. Nguyen**<sup>4†</sup>
-
-<sup>1</sup>Posts & Telecommunications Institute of Technology &nbsp;
-<sup>2</sup>VinUniversity &nbsp;
-<sup>3</sup>University of Bath &nbsp;
-<sup>4</sup>National University of Singapore
-
-<sup>\*</sup>Equal contribution &nbsp; <sup>†</sup>Equal advising
-
 **NeurIPS 2026**
 
 [![Conference](https://img.shields.io/badge/NeurIPS-2026-4b44ce.svg)](https://neurips.cc/)
